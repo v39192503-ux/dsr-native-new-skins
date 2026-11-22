@@ -1,6 +1,7 @@
 // nn::os threads and thread-local storage.
 #include <pthread.h>
 #include <sched.h>
+#include <sys/resource.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -47,6 +48,7 @@ struct HostThread {
     uintptr_t stack_lo = 0, stack_hi = 0;
     std::mutex m;
     std::atomic<uint32_t> state{0};
+    std::atomic<bool> poller{false};  // see MarkPoller
 };
 
 std::mutex g_threads_mutex;
@@ -96,11 +98,31 @@ void RunTlsDestructors() {
     }
 }
 
+// The online-services scheduler thread ("NexusRevolution") polls its job list in a loop of very short sleeps: about a
+// third of a core all the time (Helio G80), for services that are never reached here. Its sleeps are stretched to
+// kPollerSleepNs and it runs at a low priority, so it stays off the cores and power the game needs.
+constexpr int64_t kPollerSleepNs = 5'000'000;
+void MarkPoller(HostThread* ht) {
+    if (ht->name == "NexusRevolution") ht->poller.store(true, std::memory_order_relaxed);
+}
+// On the poller thread itself, before it sleeps: lowers its priority once, returns the sleep to use.
+int64_t PollerSleep(int64_t ns) {
+    thread_local bool lowered = false;
+    if (!lowered) {
+        lowered = true;
+        setpriority(PRIO_PROCESS, 0, 10);
+        LOGI(kTag, "'%s': low priority, sleeps of under %.0f ms stretched to %.0f ms (online-services polling)",
+             t_current->name.c_str(), kPollerSleepNs / 1e6, kPollerSleepNs / 1e6);
+    }
+    return std::max(ns, kPollerSleepNs);
+}
+
 void* ThreadTrampoline(void* p) {
     auto* ht = static_cast<HostThread*>(p);
     t_current = ht;
     QueryStack(ht);
     pthread_setname_np(pthread_self(), ht->name.empty() ? "guest" : ht->name.substr(0, 15).c_str());
+    MarkPoller(ht);
     dsr::platform::ReleaseInheritedPin();  // created by the pinned main thread (few fast cores: not pinned)
     dsr::profiler::RegisterCurrentThread(ht->name.empty() ? "guest" : ht->name.c_str());
     LOGD(kTag, "thread %llu '%s' start entry=%p arg=%p", (unsigned long long)ht->id, ht->name.c_str(), ht->entry,
@@ -218,6 +240,7 @@ HLE_FUNC(_ZN2nn2os13SetThreadNameEPNS0_10ThreadTypeEPKc, void, nn_os_SetThreadNa
     if (HostThread* ht = Lookup(t)) {
         ht->name = name ? name : "";
         ht->name_ptr = nullptr;
+        MarkPoller(ht);
         if (ht == t_current) pthread_setname_np(pthread_self(), ht->name.substr(0, 15).c_str());
     }
 }
@@ -226,6 +249,7 @@ HLE_FUNC(nnosSetThreadNamePointer, void, nnosSetThreadNamePointer, (GuestThread 
     if (HostThread* ht = Lookup(t)) {
         ht->name = name ? name : "";
         ht->name_ptr = name;
+        MarkPoller(ht);
     }
 }
 
@@ -323,6 +347,7 @@ HLE_FUNC(_ZN2nn2os11SleepThreadENS_8TimeSpanE, void, nn_os_SleepThread, (int64_t
     // In the background the game's polling threads (network, streaming) are held at their next sleep, after a
     // grace period so a save being written finishes first.
     dsr::platform::WaitWhilePaused(3000);
+    if (t_current && t_current->poller.load(std::memory_order_relaxed)) ns = PollerSleep(ns);
     if (ns <= 0) {
         sched_yield();
         return;
@@ -333,7 +358,15 @@ HLE_FUNC(_ZN2nn2os11SleepThreadENS_8TimeSpanE, void, nn_os_SleepThread, (int64_t
 }
 HLE_ALIAS(nnosSleepThread, nn_os_SleepThread);
 
-HLE_FUNC(_ZN2nn2os11YieldThreadEv, void, nn_os_YieldThread, ()) { sched_yield(); }
+HLE_FUNC(_ZN2nn2os11YieldThreadEv, void, nn_os_YieldThread, ()) {
+    if (t_current && t_current->poller.load(std::memory_order_relaxed)) {
+        const int64_t ns = PollerSleep(0);
+        timespec ts{0, long(ns)};
+        nanosleep(&ts, nullptr);
+        return;
+    }
+    sched_yield();
+}
 
 HLE_FUNC(_ZN2nn2os20GetCurrentCoreNumberEv, int, nn_os_GetCurrentCoreNumber, ()) {
     int c = sched_getcpu();

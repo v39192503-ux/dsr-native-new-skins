@@ -25,6 +25,10 @@ struct RuntimeConfig {
     // follows the frame time, so the game keeps its speed (dynamic fps, after PR #13).
     bool dynamic_fps = false;
     int min_fps = 20;             // lowest rate fps = auto may use (15..30); also the longest game time step
+    // fps = unlocked (experimental): paced at the screen's highest refresh rate (display_hz, 60..144) instead of at
+    // most 60. The game's time step follows the frame time down to that period; above 60 its physics may misbehave.
+    bool unlocked_fps = false;
+    int display_hz = 60;          // the screen's highest refresh rate at its resolution (from the activity)
     bool async_pipelines = true;  // compile new GPU pipelines off the render thread (no hitch; the draw waits a frame)
     bool auto_capture = false;    // diagnostics: save a few frame captures automatically during play
     bool profile = true;          // diagnostics: sampling CPU profile of the busy threads, logged every 10 s
@@ -77,6 +81,21 @@ struct RuntimeConfig {
     // texture_mip_skip = 1: big BC textures (512x512 and up, with mip levels) are loaded without their most detailed
     // level: half the width and height, ~75% less data to convert, upload and sample; softer up close.
     int texture_mip_skip = 0;
+    // pass_load_skip = 0: render passes always load their targets (by default a pass learned to overwrite a target
+    // starts without loading it: vk_backend.cpp, PassCoverage).
+    bool pass_load_skip = true;
+    // staging_memory: the memory the CPU copies each frame's vertex / uniform data into for the GPU. auto = CPU-cached
+    // (and GPU-coherent) memory where the driver offers it on Adreno (Turnip's default staging memory is uncached:
+    // the render thread's copies cost more than with Qualcomm's driver), else the first host-visible memory;
+    // cached / uncached force it either way.
+    std::string staging_memory = "auto";
+    // recorder_copies = 1: a copy thread copies the draws' uniform and vertex data (vk_backend.cpp, CopyOut). Off by
+    // default: on the OnePlus 6T (4 fast cores, throttled) the extra busy thread cost the render thread more than
+    // it saved; the render thread copies.
+    bool recorder_copies = false;
+    // lighter_post_fx = 1: no ambient occlusion, depth of field, camera motion blur or light shafts (the engine's own
+    // switches; read at start-up). The menu turns it on with performance mode on GPUs without BC support.
+    bool lighter_post_fx = false;
     // skip_intro = 1: the company logos at the start are skipped (straight to the title movie).
     bool skip_intro = false;
     int max_anisotropy = 0;  // limit on the game's anisotropic texture filtering (0 = the game's own level)
@@ -125,6 +144,11 @@ void ReportGpuFrameTime(double ms);
 void SetGpuHasBc(bool has);
 int GpuHasBc();
 bool FrameRateAdjustable();  // the frame rate patches are in: config.target_fps may change while the game runs
+// The rate a fixed cap paces at: target_fps (30..60), or with fps = unlocked the screen's refresh rate (60..144).
+inline int FixedFps(const RuntimeConfig& c) {
+    if (c.unlocked_fps) return c.display_hz < 60 ? 60 : (c.display_hz > 144 ? 144 : c.display_hz);
+    return c.target_fps < 30 ? 30 : (c.target_fps > 60 ? 60 : c.target_fps);
+}
 
 // Prints an import binding summary (implemented / unimplemented / data) to the log.
 void LogImportReport(bool list_unimplemented);

@@ -245,6 +245,74 @@ std::vector<VkFormat> ImageCandidates(int f) {
     }
 }
 
+// Open-addressing hash table from 64-bit keys to V, for the per-draw caches the render thread looks up several
+// times per draw (uploads, geometry, index ranges): no allocation per entry (std::unordered_map allocated a node
+// for each of the thousands of entries a frame adds; operator new and free were ~5% of the render thread) and
+// Clear() is O(1) (a generation counter), as the upload cache is emptied at every list and every in-list write.
+// Find()'s pointer is valid until the next Insert().
+template <typename V>
+class FlatMap {
+public:
+    explicit FlatMap(size_t capacity = 1024) { Rehash(capacity); }  // a power of two
+    V* Find(uint64_t key) {
+        for (size_t i = Index(key);; i = (i + 1) & mask_) {
+            Slot& s = slots_[i];
+            if (s.gen != gen_) return nullptr;
+            if (s.key == key) return &s.val;
+        }
+    }
+    V& Insert(uint64_t key, const V& v) {
+        if ((count_ + 1) * 2 > slots_.size()) Rehash(slots_.size() * 2);
+        for (size_t i = Index(key);; i = (i + 1) & mask_) {
+            Slot& s = slots_[i];
+            if (s.gen != gen_) {
+                s.gen = gen_;
+                s.key = key;
+                s.val = v;
+                count_++;
+                return s.val;
+            }
+            if (s.key == key) {
+                s.val = v;
+                return s.val;
+            }
+        }
+    }
+    void Clear() {
+        if (!count_) return;
+        count_ = 0;
+        if (++gen_ == 0) {  // wrapped: forget every slot for real
+            for (Slot& s : slots_) s.gen = 0;
+            gen_ = 1;
+        }
+    }
+    size_t size() const { return count_; }
+
+private:
+    struct Slot {
+        uint64_t key = 0;
+        uint32_t gen = 0;
+        V val{};
+    };
+    std::vector<Slot> slots_;
+    size_t mask_ = 0, count_ = 0;
+    int shift_ = 64;
+    uint32_t gen_ = 1;
+    size_t Index(uint64_t key) const { return size_t((key * 0x9E3779B97F4A7C15ull) >> shift_); }
+    void Rehash(size_t cap) {
+        std::vector<Slot> old;
+        old.swap(slots_);
+        const uint32_t old_gen = gen_;
+        slots_.assign(cap, Slot{});
+        mask_ = cap - 1;
+        shift_ = 64 - __builtin_ctzll(cap);
+        gen_ = 1;
+        count_ = 0;
+        for (const Slot& s : old)
+            if (s.gen == old_gen) Insert(s.key, s.val);
+    }
+};
+
 struct VertexFormat {
     VkFormat format = VK_FORMAT_UNDEFINED;
     uint32_t bytes = 0;
@@ -282,9 +350,16 @@ VertexFormat VertexFormatOf(int f) {
         {62, VK_FORMAT_A2B10G10R10_UINT_PACK32, 4, true, false},
         {63, VK_FORMAT_B10G11R11_UFLOAT_PACK32, 4, false, false},
     };
-    for (const E& e : kTable)
-        if (e.nvn == f) return {e.vk, e.bytes, e.i, e.s};
-    return {};
+    // Looked up for every attribute of every draw: indexed by the NVN format instead of searching the table.
+    struct Index {
+        VertexFormat v[64];
+        Index() {
+            for (const E& e : kTable)
+                if (e.nvn >= 0 && e.nvn < 64) v[e.nvn] = {e.vk, e.bytes, e.i, e.s};
+        }
+    };
+    static const Index kIndex;
+    return f >= 0 && f < 64 ? kIndex.v[f] : VertexFormat{};
 }
 
 // ---- NVN enum -> Vulkan (NVN uses GL-style orderings; confirmed from the state logs) --------------------------
@@ -466,7 +541,7 @@ struct Image {
     uint64_t next_check_list = 0;
     uint32_t check_interval = 1;
     std::map<std::vector<uint32_t>, VkImageView> views;
-    std::unordered_map<uint64_t, VkImageView> fast_views;  // same views by hashed key
+    FlatMap<VkImageView> fast_views{16};  // same views by hashed key
     uint64_t addr = 0;     // storage in game memory
     TextureState tex{};    // as the game described it (layout of that storage)
     VkFormat twin = VK_FORMAT_UNDEFINED;  // sRGB/linear counterpart views may use (image is mutable-format)
@@ -493,6 +568,8 @@ struct Image {
     VkClearValue clear_value{};
     VkImageAspectFlags clear_aspect = 0;
     int clear_layer = 0, clear_level = 0;
+    uint64_t serial = 0;      // unique per created image (a background conversion finds its image again)
+    uint64_t upload_gen = 0;  // uploads so far (a conversion for an older upload is dropped)
 };
 
 struct Shader {
@@ -619,6 +696,7 @@ public:
                 }
                 case CmdType::CopyBufferToBuffer:
                     if (c.size64 && GuestRangeValid(c.src_addr, c.size64) && GuestRangeValid(c.dst_addr, c.size64)) {
+                        FinishCopies();  // earlier draws' data copied before it changes
                         memmove(reinterpret_cast<void*>(c.dst_addr), reinterpret_cast<const void*>(c.src_addr), c.size64);
                         MemoryWrittenInList(c.dst_addr, c.size64);
                         list_b2b_copies_++;
@@ -628,6 +706,7 @@ public:
                 case CmdType::UpdateUniform: {
                     const std::span<const uint8_t> data = Items<uint8_t>(c);
                     if (!data.empty() && GuestRangeValid(c.dst_addr, data.size())) {
+                        FinishCopies();
                         memcpy(reinterpret_cast<void*>(c.dst_addr), data.data(), data.size());
                         MemoryWrittenInList(c.dst_addr, data.size());  // cached copies may include the old bytes
                         list_updates_++;
@@ -795,6 +874,7 @@ public:
         // command buffer had bound): sampler ids then resolve as before pools were tracked. Lists it calls
         // inherit its pool.
         st_.sampler_pool = 0;
+        ApplyBgConversions();
         MaybeArmCapture();
         ApplyDirtyMarks();
         if (!watched_copies_.empty()) CheckWatchedCopies();
@@ -816,6 +896,7 @@ public:
             ResetPersistentSets();
             persist_full_ = false;
         }
+        FinishCopies();  // the game may reuse the memory once the list is done
         if (capture_active_) FinishCapture();
         CheckSlowList(marks);
         last_list_draws_ = drawn_ - list_start_draws_;
@@ -1248,7 +1329,7 @@ public:
         if (!EnsureDevice()) return;
         ReportDraws();
         // The frame rate cap changed while the game runs (settings menu): tell the display.
-        if (window_ && swapchain_ && window_fps_ && window_fps_ != std::clamp(dsr::GetRuntime().config.target_fps, 30, 60))
+        if (window_ && swapchain_ && window_fps_ && window_fps_ != dsr::FixedFps(dsr::GetRuntime().config))
             SetWindowFrameRate();
         Image* src = tex.valid ? FindImage(tex) : nullptr;
         if (src && !(src->written && !IsDepthFormat(src->nvn_format))) src = nullptr;
@@ -1501,6 +1582,8 @@ private:
         ProbePatchedBc();
         dsr::SetGpuHasBc(features_.textureCompressionBC || bc_forced_);
         mip_skip_ = dsr::GetRuntime().config.texture_mip_skip > 0;
+        load_skip_ = dsr::GetRuntime().config.pass_load_skip;
+        ChooseStagingMemory();
         if (mip_skip_) LOGI(kTag, "texture_mip_skip: big BC textures are loaded without their most detailed level");
         if (const int rw = dsr::GetRuntime().config.render_width, rh = dsr::GetRuntime().config.render_height;
             (rw != 1280 || rh != 720) && rw > 0 && rh > 0 && dsr::GetRuntime().config.hud_box) {
@@ -1567,6 +1650,35 @@ private:
         return true;
     }
 
+    // Memory for the per-frame staging buffers (the slots' streams, the geometry cache): see settings staging_memory.
+    VkMemoryPropertyFlags staging_flags_ = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+    void ChooseStagingMemory() {
+        std::string types;
+        bool cached_coherent = false;
+        for (uint32_t i = 0; i < mem_props_.memoryTypeCount; i++) {
+            const VkMemoryPropertyFlags f = mem_props_.memoryTypes[i].propertyFlags;
+            char t[64];
+            snprintf(t, sizeof(t), " %u:%s%s%s%s", i, f & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT ? "D" : "",
+                     f & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT ? "V" : "", f & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT ? "C" : "",
+                     f & VK_MEMORY_PROPERTY_HOST_CACHED_BIT ? "$" : "");
+            types += t;
+            const VkMemoryPropertyFlags want = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT |
+                                               VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
+            if ((f & want) == want) cached_coherent = true;
+        }
+        const std::string& mode = dsr::GetRuntime().config.staging_memory;
+        const bool adreno = props_.vendorID == 0x5143;
+        const bool cached = cached_coherent && (mode == "cached" || (mode != "uncached" && adreno));
+        if (cached) staging_flags_ |= VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
+        LOGI(kTag, "memory types (D device-local, V host-visible, C coherent, $ cached):%s | staging memory: %s "
+             "(staging_memory %s)", types.c_str(), cached ? "cached" : "first host-visible", mode.c_str());
+    }
+    // A host-visible, coherent type for staging buffers: cached as chosen above where the buffer allows it.
+    uint32_t StagingMemory(uint32_t bits) {
+        for (uint32_t i = 0; i < mem_props_.memoryTypeCount; i++)
+            if ((bits & (1u << i)) && (mem_props_.memoryTypes[i].propertyFlags & staging_flags_) == staging_flags_) return i;
+        return FindMemory(bits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    }
     uint32_t FindMemory(uint32_t bits, VkMemoryPropertyFlags want) {
         for (uint32_t i = 0; i < mem_props_.memoryTypeCount; i++)
             if ((bits & (1u << i)) && (mem_props_.memoryTypes[i].propertyFlags & want) == want) return i;
@@ -1587,8 +1699,7 @@ private:
         vkGetBufferMemoryRequirements(device_, stream_, &req);
         VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
         ai.allocationSize = req.size;
-        ai.memoryTypeIndex =
-            FindMemory(req.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+        ai.memoryTypeIndex = StagingMemory(req.memoryTypeBits);
         if (vkAllocateMemory(device_, &ai, nullptr, &stream_memory_) != VK_SUCCESS) return false;
         vkBindBufferMemory(device_, stream_, stream_memory_, 0);
         void* p = nullptr;
@@ -1722,7 +1833,7 @@ private:
     // the commands; the slot's earlier submission has finished on the GPU).
     void ResetTransient() {
         stream_off_ = kMaxUniformRange;  // [0, 64K) is the zero buffer
-        stream_cache_.clear();
+        stream_cache_.Clear();
         Rec([this, i = slot_](VkCommandBuffer) {
             Slot& sl = slots_[i];
             rec_slot_ = i;
@@ -1732,7 +1843,7 @@ private:
             sl.extra_used = 0;
             for (VkFramebuffer fb : sl.framebuffers) vkDestroyFramebuffer(device_, fb, nullptr);
             sl.framebuffers.clear();
-            desc_cache_.clear();
+            desc_cache_.Clear();
         });
     }
     void Begin() {
@@ -1770,7 +1881,7 @@ private:
     void SetWindowFrameRate() {
         using Fn = int32_t (*)(ANativeWindow*, float, int8_t);
         static Fn fn = reinterpret_cast<Fn>(dlsym(RTLD_DEFAULT, "ANativeWindow_setFrameRate"));
-        const float fps = float(std::clamp(dsr::GetRuntime().config.target_fps, 30, 60));
+        const float fps = float(dsr::FixedFps(dsr::GetRuntime().config));
         if (!fn) {
             LOGI(kTag, "ANativeWindow_setFrameRate not available: display rate left to the system");
             return;
@@ -2186,7 +2297,7 @@ private:
         for (auto& [k, v] : img.views) r.views.push_back(v);
         retired_.push_back(std::move(r));
         img.views.clear();
-        img.fast_views.clear();
+        img.fast_views.Clear();
         img.image = ni;
         img.memory = nm;
         img.layout = VK_IMAGE_LAYOUT_UNDEFINED;
@@ -2209,8 +2320,8 @@ private:
             });
         }
         Rec([this](VkCommandBuffer) {
-            persist_cache_.clear();
-            desc_cache_.clear();
+            persist_cache_.Clear();
+            desc_cache_.Clear();
         });
         if (keep || old_layout != VK_IMAGE_LAYOUT_UNDEFINED) {
             const VkImageLayout to = old_layout != VK_IMAGE_LAYOUT_UNDEFINED ? old_layout : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
@@ -2276,6 +2387,7 @@ private:
         const bool storage = (feats & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) && (!lean_images_ || storage_addrs_.count(t.addr));
         const bool mutable_fmt = img.twin != VK_FORMAT_UNDEFINED && (!lean_images_ || mutable_addrs_.count(t.addr));
         if (!AllocImage(img, storage, mutable_fmt, &img.image, &img.memory)) return nullptr;
+        img.serial = ++image_serial_;
         if (images_created_++ < 48)
             LOGI(kTag, "image %dx%d%s NVN format %d (target %d, %d levels, %d layers) -> Vulkan format %d", img.width,
                  img.height, img.depth > 1 ? "x3D" : "", img.nvn_format, img.target, img.levels, img.layers, vf);
@@ -2286,8 +2398,8 @@ private:
         if (!persist_pool_) return;
         Drain();
         vkResetDescriptorPool(device_, persist_pool_, 0);
-        persist_cache_.clear();
-        desc_cache_.clear();  // may hold sets from the persistent pool
+        persist_cache_.Clear();
+        desc_cache_.Clear();  // may hold sets from the persistent pool
         InvalidateBoundState();
         persist_resets_++;
     }
@@ -2314,8 +2426,8 @@ private:
         images_retired_++;
         // Cached descriptor sets may name its views: forgotten (their pool is emptied when full, GPU idle).
         Rec([this](VkCommandBuffer) {
-            persist_cache_.clear();
-            desc_cache_.clear();
+            persist_cache_.Clear();
+            desc_cache_.Clear();
         });
         img = Image{};
     }
@@ -2384,66 +2496,211 @@ private:
     double bc_convert_ms_ = 0;     // conversion time, for the stats line
     uint64_t bc_cache_hits_ = 0, bc_converted_levels_ = 0;
 
-    void RunBcJobs() {
-        if (bc_jobs_.empty()) return;
-        const auto t0 = std::chrono::steady_clock::now();
-        bc_tasks_.clear();
-        for (uint32_t j = 0; j < bc_jobs_.size(); j++) {
-            const BcJob& job = bc_jobs_[j];
+    // Converts rows [k.row0, k.row0 + k.rows) of one slice of job `j` (quick: the preview encode).
+    static void ConvertTask(const BcJob& j, const BcTask& k, bool quick) {
+        thread_local std::vector<uint8_t> rgba;
+        const int bpb = (j.kind == BcKind::BC1 || j.kind == BcKind::BC4U || j.kind == BcKind::BC4S) ? 8 : 16;
+        const uint8_t* blocks = j.blocks + (size_t(k.z) * size_t(j.brows) + size_t(k.row0)) * size_t(j.bx) * bpb;
+        const int y0 = k.row0 * 4, hh = std::min(j.h - y0, k.rows * 4);
+        const size_t slice = j.out_bytes / size_t(std::max(1, j.depth));
+        uint8_t* out = j.out + size_t(k.z) * slice;
+        const int bxn = (j.w + 3) / 4;
+        switch (j.to) {
+            case BcTo::Decoded:
+                BcDecode(j.kind, blocks, j.bx, k.rows, out + size_t(y0) * size_t(j.w) * size_t(BcDecodedBytes(j.kind)),
+                         j.w, hh);
+                break;
+            case BcTo::Etc2:
+            case BcTo::Etc2Rgba8:
+                rgba.resize(size_t(j.w) * size_t(hh) * 4);
+                BcDecode(j.kind, blocks, j.bx, k.rows, rgba.data(), j.w, hh);
+                if (j.to == BcTo::Etc2)
+                    EncodeEtc2Rgb(out + size_t(k.row0) * size_t(bxn) * 8, rgba.data(), j.w, hh, 1, j.punch, quick);
+                else
+                    EncodeEtc2Rgba8(out + size_t(k.row0) * size_t(bxn) * 16, rgba.data(), j.w, hh, 1, quick);
+                break;
+        }
+    }
+    static void MakeTasks(const std::vector<BcJob>& jobs, std::vector<BcTask>* tasks) {
+        tasks->clear();
+        for (uint32_t j = 0; j < jobs.size(); j++) {
+            const BcJob& job = jobs[j];
             const int band = std::max(2, 4096 / std::max(1, job.bx));  // ~4096 blocks per task
             for (int z = 0; z < job.depth; z++)
                 for (int r = 0; r < job.brows && r * 4 < job.h; r += band)
-                    bc_tasks_.push_back({j, z, r, std::min(band, job.brows - r)});
+                    tasks->push_back({j, z, r, std::min(band, job.brows - r)});
         }
-        WorkPool::Get().Run(bc_tasks_.size(), [this](size_t i) {
-            thread_local std::vector<uint8_t> rgba;
+    }
+    void CacheEtc(uint64_t key, const uint8_t* data, size_t bytes) {
+        if (!key) return;
+        if (etc_cache_bytes_ + bytes > kEtcCacheLimit) {
+            etc_cache_.clear();
+            etc_cache_bytes_ = 0;
+        }
+        auto& e = etc_cache_[key];
+        etc_cache_bytes_ += bytes - e.size();
+        e.assign(data, data + bytes);
+    }
+
+    // quick: preview encodes (not cached; the full ones follow from the background, see DeferBcJobs).
+    void RunBcJobs(bool quick = false) {
+        if (bc_jobs_.empty()) return;
+        const auto t0 = std::chrono::steady_clock::now();
+        MakeTasks(bc_jobs_, &bc_tasks_);
+        WorkPool::Get().Run(bc_tasks_.size(), [this, quick](size_t i) {
             const BcTask& k = bc_tasks_[i];
-            const BcJob& j = bc_jobs_[k.job];
-            const int bpb = (j.kind == BcKind::BC1 || j.kind == BcKind::BC4U || j.kind == BcKind::BC4S) ? 8 : 16;
-            const uint8_t* blocks = j.blocks + (size_t(k.z) * size_t(j.brows) + size_t(k.row0)) * size_t(j.bx) * bpb;
-            const int y0 = k.row0 * 4, hh = std::min(j.h - y0, k.rows * 4);
-            const size_t slice = j.out_bytes / size_t(std::max(1, j.depth));
-            uint8_t* out = j.out + size_t(k.z) * slice;
-            const int bxn = (j.w + 3) / 4;
-            switch (j.to) {
-                case BcTo::Decoded:
-                    BcDecode(j.kind, blocks, j.bx, k.rows, out + size_t(y0) * size_t(j.w) * size_t(BcDecodedBytes(j.kind)),
-                             j.w, hh);
-                    break;
-                case BcTo::Etc2:
-                case BcTo::Etc2Rgba8:
-                    rgba.resize(size_t(j.w) * size_t(hh) * 4);
-                    BcDecode(j.kind, blocks, j.bx, k.rows, rgba.data(), j.w, hh);
-                    if (j.to == BcTo::Etc2)
-                        EncodeEtc2Rgb(out + size_t(k.row0) * size_t(bxn) * 8, rgba.data(), j.w, hh, 1, j.punch);
-                    else
-                        EncodeEtc2Rgba8(out + size_t(k.row0) * size_t(bxn) * 16, rgba.data(), j.w, hh, 1);
-                    break;
-            }
+            ConvertTask(bc_jobs_[k.job], k, quick);
         });
         for (const BcJob& j : bc_jobs_) {
             bc_converted_levels_++;
-            if (!j.key) continue;
-            if (etc_cache_bytes_ + j.out_bytes > kEtcCacheLimit) {
-                etc_cache_.clear();
-                etc_cache_bytes_ = 0;
-            }
-            auto& e = etc_cache_[j.key];
-            etc_cache_bytes_ += j.out_bytes - e.size();
-            e.assign(j.out, j.out + j.out_bytes);
+            if (!quick) CacheEtc(j.key, j.out, j.out_bytes);
         }
         const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
         bc_convert_ms_ += ms;
         static int logged = 0;
         if (ms > 30 && logged++ < 20)
-            LOGI(kTag, "texture conversion: %zu levels in %zu tasks, %.1f ms (%d workers + render thread)",
-                 bc_jobs_.size(), bc_tasks_.size(), ms, WorkPool::Get().Workers());
+            LOGI(kTag, "texture conversion: %zu levels in %zu tasks, %.1f ms (%d workers + render thread)%s",
+                 bc_jobs_.size(), bc_tasks_.size(), ms, WorkPool::Get().Workers(),
+                 quick ? " (quick preview)" : "");
         bc_jobs_.clear();
+    }
+
+    // ---- Background conversion of big textures --------------------------------------------------------------
+    // A big texture converted to ETC2 on the render thread held the frame for up to half a second (Helio G80:
+    // 250-580 ms for a 2048x1024 level): such textures get a quick, coarser encode at once (several times faster)
+    // and the full one is made on a background thread, in small batches on the worker pool (a texture the render
+    // thread needs meanwhile waits one batch at most). The result replaces the preview at the start of a later
+    // command list, unless the texture was re-created or uploaded again in between.
+    static constexpr size_t kBgTexels = 512 * 512;  // ETC2 work (texels to convert) from which a texture goes there
+    struct BgConversion {
+        uint64_t addr = 0, serial = 0, upload_gen = 0;
+        std::vector<uint8_t> blocks, out;
+        std::vector<BcJob> jobs;                 // blocks / out point into the vectors above
+        std::vector<VkBufferImageCopy> regions;  // bufferOffset: into `out`
+        double ms = 0;
+    };
+    std::mutex bg_mutex_;
+    std::condition_variable bg_cv_;
+    std::deque<std::unique_ptr<BgConversion>> bg_queue_, bg_done_;
+    bool bg_started_ = false;
+    uint64_t bg_levels_ = 0, bg_dropped_ = 0;
+    double bg_ms_ = 0;
+
+    void BgMain() {
+        pthread_setname_np(pthread_self(), "dsr-texconv");
+        dsr::platform::UseAllCores();
+        std::vector<BcTask> tasks;
+        for (;;) {
+            std::unique_ptr<BgConversion> c;
+            {
+                std::unique_lock<std::mutex> lk(bg_mutex_);
+                bg_cv_.wait(lk, [&] { return !bg_queue_.empty(); });
+                c = std::move(bg_queue_.front());
+                bg_queue_.pop_front();
+            }
+            const auto t0 = std::chrono::steady_clock::now();
+            MakeTasks(c->jobs, &tasks);
+            // Batches of one task per thread: the pool runs one batch at a time, so the render thread's own
+            // conversions get their turn between batches.
+            const size_t batch = size_t(WorkPool::Get().Workers()) + 1;
+            for (size_t first = 0; first < tasks.size(); first += batch) {
+                const size_t n = std::min(batch, tasks.size() - first);
+                WorkPool::Get().Run(n, [&](size_t i) {
+                    const BcTask& k = tasks[first + i];
+                    ConvertTask(c->jobs[k.job], k, false);
+                });
+            }
+            c->ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+            std::lock_guard<std::mutex> lk(bg_mutex_);
+            bg_done_.push_back(std::move(c));
+        }
+    }
+
+    // Moves bc_jobs_ (outputs in the stream, copied by `regions`) to a background conversion; they still get a
+    // quick encode into the stream (RunBcJobs(true)).
+    void DeferBcJobs(const Image& img, const std::vector<VkBufferImageCopy>& regions) {
+        auto c = std::make_unique<BgConversion>();
+        c->addr = img.addr;
+        c->serial = img.serial;
+        c->upload_gen = img.upload_gen;
+        size_t blocks = 0, out = 0;
+        for (const BcJob& j : bc_jobs_) {
+            const int bpb = (j.kind == BcKind::BC1 || j.kind == BcKind::BC4U || j.kind == BcKind::BC4S) ? 8 : 16;
+            blocks += size_t(j.bx) * size_t(j.brows) * size_t(j.depth) * size_t(bpb);
+            out += (j.out_bytes + 15) & ~size_t(15);
+        }
+        c->blocks.resize(blocks);
+        c->out.resize(out);
+        size_t bo = 0, oo = 0;
+        for (const BcJob& j : bc_jobs_) {
+            const int bpb = (j.kind == BcKind::BC1 || j.kind == BcKind::BC4U || j.kind == BcKind::BC4S) ? 8 : 16;
+            const size_t nb = size_t(j.bx) * size_t(j.brows) * size_t(j.depth) * size_t(bpb);
+            memcpy(c->blocks.data() + bo, j.blocks, nb);
+            BcJob bj = j;
+            bj.blocks = c->blocks.data() + bo;
+            bj.out = c->out.data() + oo;
+            const VkDeviceSize stream_off = VkDeviceSize(j.out - stream_ptr_);
+            for (const VkBufferImageCopy& r : regions)
+                if (r.bufferOffset == stream_off) {
+                    VkBufferImageCopy rr = r;
+                    rr.bufferOffset = oo;
+                    c->regions.push_back(rr);
+                    break;
+                }
+            c->jobs.push_back(bj);
+            bo += nb;
+            oo += (j.out_bytes + 15) & ~size_t(15);
+        }
+        std::lock_guard<std::mutex> lk(bg_mutex_);
+        if (!bg_started_) {
+            bg_started_ = true;
+            std::thread([this] { BgMain(); }).detach();
+        }
+        bg_queue_.push_back(std::move(c));
+        bg_cv_.notify_one();
+    }
+
+    // Uploads finished background conversions over their previews (start of a command list).
+    void ApplyBgConversions() {
+        std::deque<std::unique_ptr<BgConversion>> done;
+        {
+            std::lock_guard<std::mutex> lk(bg_mutex_);
+            if (bg_done_.empty()) return;
+            done.swap(bg_done_);
+        }
+        for (auto& c : done) {
+            auto it = images_.find(c->addr);
+            if (it == images_.end() || it->second.serial != c->serial || it->second.upload_gen != c->upload_gen ||
+                c->out.size() > kStreamSize - kMaxUniformRange) {
+                bg_dropped_++;
+                continue;
+            }
+            Image& img = it->second;
+            Begin();
+            EndRendering();
+            if (StreamRemaining() < c->out.size() + 1024) Flush();
+            const VkDeviceSize off = StreamAlloc(c->out.size(), 16);
+            memcpy(stream_ptr_ + off, c->out.data(), c->out.size());
+            for (VkBufferImageCopy& r : c->regions) r.bufferOffset += off;
+            for (const BcJob& j : c->jobs) CacheEtc(j.key, j.out, j.out_bytes);
+            Transition(img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+            Rec([regions = std::move(c->regions), buf = stream_, image = img.image](VkCommandBuffer cb) {
+                vkCmdCopyBufferToImage(cb, buf, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, uint32_t(regions.size()),
+                                       regions.data());
+            });
+            bg_levels_ += c->jobs.size();
+            bg_ms_ += c->ms;
+            static int logged = 0;
+            if (logged++ < 20)
+                LOGI(kTag, "background texture conversion: %dx%d, %zu levels in %.0f ms (a quick preview was shown "
+                     "meanwhile)", img.width, img.height, c->jobs.size(), c->ms);
+        }
     }
 
     // Fills a sampled texture from game memory: deswizzle each level/layer into the stream, then copy.
     void Upload(Image& img, const TexRef& t) {
         img.uploaded = true;
+        img.upload_gen++;
         img.cpu_source = true;
         img.sample_hash = SampleHash(t);
         img.checked_in_list = list_counter_;
@@ -2536,7 +2793,18 @@ private:
                 regions.push_back(r);
             }
         }
-        RunBcJobs();  // the converted texels are in the stream before the copy is recorded
+        // The converted texels are in the stream before the copy is recorded. Much ETC2 work: a quick preview now,
+        // the full encode in the background.
+        bool deferred = false;
+        if (img.bc_to != BcTo::Decoded && !bc_jobs_.empty() && !capture_active_) {
+            size_t texels = 0;
+            for (const BcJob& j : bc_jobs_) texels += size_t(j.w) * size_t(j.h) * size_t(j.depth);
+            if (texels >= kBgTexels) {
+                DeferBcJobs(img, regions);
+                deferred = true;
+            }
+        }
+        RunBcJobs(deferred);
         Transition(img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
         Rec([regions = std::move(regions), buf = stream_, image = img.image](VkCommandBuffer cb) {
             vkCmdCopyBufferToImage(cb, buf, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, uint32_t(regions.size()),
@@ -2588,8 +2856,7 @@ private:
         const uint32_t parts[11] = {uint32_t(type), base_layer, layers, levels, aspect, swz[0], swz[1], swz[2], swz[3],
                                     base_level, uint32_t(format)};
         k.Add(parts, sizeof(parts));
-        auto fast = img.fast_views.find(k.h);
-        if (fast != img.fast_views.end()) return fast->second;
+        if (const VkImageView* fast = img.fast_views.Find(k.h)) return *fast;
         std::vector<uint32_t> key(parts, parts + 11);
         auto it = img.views.find(key);
         if (it != img.views.end()) return it->second;
@@ -2607,7 +2874,7 @@ private:
             v = VK_NULL_HANDLE;
         }
         img.views[key] = v;
-        img.fast_views[k.h] = v;
+        img.fast_views.Insert(k.h, v);
         return v;
     }
     // The level/layer a render target view selects (clamped to the image).
@@ -2668,8 +2935,7 @@ private:
         fk.Add(&s, sizeof(SamplerObj));
         fk.Add(shadow);
         fk.Add(filterable);
-        auto fast = samplers_fast_.find(fk.h);
-        if (fast != samplers_fast_.end()) return fast->second;
+        if (const VkSampler* fast = samplers_fast_.Find(fk.h)) return *fast;
         std::vector<uint32_t> key(sizeof(SamplerObj) / 4 + 2);
         memcpy(key.data(), &s, sizeof(SamplerObj));
         key[key.size() - 2] = shadow;
@@ -2718,7 +2984,7 @@ private:
         VkSampler smp = VK_NULL_HANDLE;
         vkCreateSampler(device_, &ci, nullptr, &smp);
         samplers_[key] = smp;
-        samplers_fast_[fk.h] = smp;
+        samplers_fast_.Insert(fk.h, smp);
         return smp;
     }
 
@@ -2886,6 +3152,7 @@ private:
     // Waits until everything queued is recorded (render thread).
     void Drain() {
         if (!rec_started_) return;
+        EmitPendingCopies();  // the slot's copies go to the worker before its submission is queued
         Publish();
         auto idle = [&] {
             return rec_queued_.load(std::memory_order_acquire) == 0 && !rec_busy_.load(std::memory_order_acquire);
@@ -3003,16 +3270,26 @@ private:
     // The recorder ends the buffer and submits it once it has recorded everything queued before; the render
     // thread moves on to the next slot without waiting (it waited ~1.5 ms a frame for the recorder's tail).
     void SubmitAndWait(VkSemaphore wait, VkSemaphore signal) {
+        EmitPendingCopies();  // before the submission (they fill this slot's stream)
         Slot& sl = slots_[slot_];
         sl.ts_written = sl.ts != VK_NULL_HANDLE;
         sl.pending = true;
         sl.submits_queued++;
         sl.seq = ++submit_seq_;
-        Rec([this, i = slot_, wait, signal](VkCommandBuffer) { SubmitSlot(i, wait, signal); });
+        Rec([this, i = slot_, wait, signal, copies = copy_batches_queued_](VkCommandBuffer) {
+            WaitCopiesRecorder(copies);  // this slot's stream must be filled before the GPU reads it
+            SubmitSlot(i, wait, signal);
+        });
         Publish();  // the GPU gets it as soon as the recorder is done
         NextSlot();
     }
     // Recorder: ends slot i's command buffer and submits it (its fence always gets signalled).
+    void WaitCopiesRecorder(uint64_t target) {
+        for (int i = 0; copy_batches_done_.load(std::memory_order_acquire) < target; i++) {
+            if ((i & 1023) == 1023) std::this_thread::yield();
+            else CpuRelax();
+        }
+    }
     void SubmitSlot(int i, VkSemaphore wait, VkSemaphore signal) {
         Slot& sl = slots_[i];
         if (sl.ts) vkCmdWriteTimestamp(cmd_, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, sl.ts, 1);
@@ -3112,14 +3389,47 @@ private:
                 vkGetFenceStatus(device_, sl.fence) == VK_SUCCESS)
                 DeliverReadbacks(sl);
     }
+    // Waits until the slot's submission has finished on the GPU. The slot's command buffer, stream memory and
+    // descriptor sets are reused right after, so going on while the GPU still runs it overwrites what it is reading:
+    // garbage for a frame (vertices, constants: stretched triangles, a menu drawn from the wrong part of its texture,
+    // a frame without lighting). The wait used to give up after one 5 s timeout and carry on; a Mali-G68 log showed it
+    // giving up (VK_TIMEOUT) after much less than 5 s. Now it waits again until the fence signals (a GPU that is
+    // really stuck: up to 60 s, then the whole queue), and every early return is logged.
+    uint64_t fence_retries_ = 0;
+    void WaitSlotFence(Slot& sl) {
+        const auto start = std::chrono::steady_clock::now();
+        for (int attempt = 0;; attempt++) {
+            const VkResult r = vkWaitForFences(device_, 1, &sl.fence, VK_TRUE, 5000000000ull);
+            if (r == VK_SUCCESS) return;
+            fence_retries_++;
+            const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+            static int logged = 0;
+            if (logged < 20) {
+                logged++;
+                LOGW(kTag, "GPU fence wait returned %d after %.0f ms (attempt %d): waiting again", int(r), ms, attempt + 1);
+            }
+            if (r == VK_ERROR_DEVICE_LOST) {
+                LogOnce("device-lost", "the GPU device was lost: rendering can no longer be trusted");
+                return;
+            }
+            if (r != VK_TIMEOUT) {
+                if (vkGetFenceStatus(device_, sl.fence) == VK_SUCCESS) return;
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+            if (ms > 60000.0) {
+                LOGW(kTag, "GPU has not finished a frame in 60 s: waiting for the whole queue");
+                vkQueueWaitIdle(queue_);
+                return;
+            }
+        }
+    }
     void NextSlot() {
         const int n = (slot_ + 1) % kSlots;
         Slot& sl = slots_[n];
         if (sl.pending) {
             WaitSubmitted(sl);
             MsTimer wait_timer(wait_ms_);
-            VkResult r = vkWaitForFences(device_, 1, &sl.fence, VK_TRUE, 5000000000ull);
-            if (r != VK_SUCCESS) LogOnce("fence", "GPU did not finish within 5 s (%d)", r);
+            WaitSlotFence(sl);
             DeliverReadbacks(sl);
             CollectGpuTime(sl);
             vkResetFences(device_, 1, &sl.fence);
@@ -3663,6 +3973,47 @@ private:
         bool has_depth = false, has_stencil = false;
         VkRect2D area;
     };
+    // ---- Skipping loads of render targets a pass overwrites --------------------------------------------------
+    // Most of the game's post-processing passes (bloom, depth of field, tone mapping, downscales: about 40 of the
+    // ~60 passes of a frame) draw one full-screen quad without blending into a target that holds an older result,
+    // which the pass started by loading: on a tiled GPU (Mali, Adreno) a read of the whole image from memory into
+    // the tiles, for nothing. A pass starts with a draw (Draw -> EnsureRendering), so its first draw is known when it
+    // begins: a target that draw writes everywhere starts with "don't care" instead of a load (only the pass's render
+    // area: the rest of a bigger image is untouched). Settings pass_load_skip 0 turns it off.
+    struct FirstDraw {
+        const DrawParams* p = nullptr;
+        const Shader* fs = nullptr;
+        DeviceModes modes{};
+        bool has_depth = false, shader_depth_test = false;
+    };
+    FirstDraw first_draw_;
+    // Which of `colors` the first draw covers: a full-screen triangle or quad (3 to 6 vertices, one instance, no
+    // index buffer) over the whole target and scissor, every channel, no blending, no fragment dropped by a depth /
+    // stencil / alpha test or discard, and the fragment shader writes that target.
+    void PassCoverage(const std::vector<Image*>& colors, VkExtent2D extent, bool covered[8]) {
+        for (size_t i = 0; i < 8; i++) covered[i] = false;
+        const FirstDraw& f = first_draw_;
+        if (!load_skip_ || !f.p || !f.fs) return;
+        const DrawParams& p = *f.p;
+        if (p.index_type >= 0 || p.count < 3 || p.count > 6 || p.instances != 1) return;
+        if (f.fs->info.uses_discard || f.fs->info.writes_depth || f.shader_depth_test || st_.color.alpha_func != 8) return;
+        if (f.has_depth && (st_.depth.depth_test || st_.depth.stencil_test)) return;
+        DynState dyn;
+        DynamicState(extent, f.modes, &dyn);
+        const float vx0 = std::min(dyn.vp.x, dyn.vp.x + dyn.vp.width), vx1 = std::max(dyn.vp.x, dyn.vp.x + dyn.vp.width);
+        const float vy0 = std::min(dyn.vp.y, dyn.vp.y + dyn.vp.height), vy1 = std::max(dyn.vp.y, dyn.vp.y + dyn.vp.height);
+        if (vx0 > 0.5f || vy0 > 0.5f || vx1 < float(extent.width) - 0.5f || vy1 < float(extent.height) - 0.5f) return;
+        if (dyn.sc.offset.x > 0 || dyn.sc.offset.y > 0 ||
+            int64_t(dyn.sc.offset.x) + int64_t(dyn.sc.extent.width) < int64_t(extent.width) ||
+            int64_t(dyn.sc.offset.y) + int64_t(dyn.sc.extent.height) < int64_t(extent.height))
+            return;
+        for (size_t i = 0; i < colors.size() && i < 8; i++)
+            covered[i] = colors[i] && !(st_.color.blend_enable >> i & 1) && ((st_.channel.mask >> (4 * i)) & 0xF) == 0xF &&
+                         (f.fs->info.output_mask >> i & 1);
+    }
+    bool load_skip_ = true;
+    uint64_t loads_skipped_ = 0;
+
     bool EnsureRendering(const std::vector<Image*>& colors, Image* depth, VkExtent2D* extent) {
         std::vector<uint64_t>& key = scratch_rendering_key_;
         key.clear();
@@ -3721,6 +4072,8 @@ private:
                 });
             }
         }
+        bool covered[8];
+        PassCoverage(colors, {w, h}, covered);
         BeginPass bp;
         bp.area = {{0, 0}, {w, h}};
         for (size_t ci = 0; ci < colors.size() && ci < 8; ci++) {
@@ -3741,6 +4094,11 @@ private:
                 bp.color_formats[bp.count] = vf != VK_FORMAT_UNDEFINED ? vf : c->vk_format;
                 a.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
                 a.loadOp = c->written ? VK_ATTACHMENT_LOAD_OP_LOAD : VK_ATTACHMENT_LOAD_OP_CLEAR;
+                // See PassCoverage: a target the pass's first draw covers is not loaded.
+                if (covered[ci] && c->written && !clear_on_load) {
+                    a.loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+                    loads_skipped_++;
+                }
                 if (clear_on_load) {
                     a.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
                     a.clearValue = c->clear_value;
@@ -3820,12 +4178,11 @@ private:
                                        (uint32_t(opt.depth_test_func) << 12)};  // the depth test variant is its own shader
         Key64 fk;
         fk.Add(parts, sizeof(parts));
-        auto fast = shaders_fast_.find(fk.h);
-        if (fast != shaders_fast_.end()) return fast->second;
+        if (Shader* const* fast = shaders_fast_.Find(fk.h)) return *fast;
         std::vector<uint32_t> key(parts, parts + 6);
         auto it = shaders_.find(key);
         if (it != shaders_.end()) {
-            shaders_fast_[fk.h] = &it->second;
+            shaders_fast_.Insert(fk.h, &it->second);
             return &it->second;
         }
         Shader& s = shaders_[key];
@@ -4046,7 +4403,7 @@ private:
     // This game does not bind textures through NVN: it writes texture handles (from
     // nvnDeviceGetTextureHandle) into its own uniform buffer at binding 10, which shaders read as
     // c[13][0x20 + 8 * slot]. Read the handle from there and resolve it like a bind would.
-    std::unordered_map<uint32_t, BoundTexture> handle_memo_;
+    FlatMap<BoundTexture> handle_memo_{256};
     uint64_t handle_memo_list_ = ~0ull;
     BoundTexture HandleFromUniforms(int stage, uint32_t slot) {
         BoundTexture bt;
@@ -4058,15 +4415,14 @@ private:
         // Resolved once per list (two locked lookups in the shared pools otherwise, for every texture of every
         // draw); registrations are made before the list is submitted.
         if (handle_memo_list_ != list_counter_) {
-            handle_memo_.clear();
+            handle_memo_.Clear();
             handle_memo_list_ = list_counter_;
         }
-        auto memo = handle_memo_.find(handle);
-        if (memo != handle_memo_.end()) return memo->second;
+        if (const BoundTexture* memo = handle_memo_.Find(handle)) return *memo;
         bt.texture = TextureById(int(handle & 0xFFFFF));
         bt.sampler = SamplerById(int(handle >> 20), reinterpret_cast<const void*>(st_.sampler_pool));
         bt.valid = bt.texture.valid;
-        handle_memo_.emplace(handle, bt);
+        handle_memo_.Insert(handle, bt);
         if (!bt.valid && handles_logged_++ < 8)
             LOGW(kTag, "texture handle 0x%08x (stage %d slot %u) does not name a registered texture", handle, stage, slot);
         return bt;
@@ -4091,7 +4447,10 @@ private:
     }
     struct PhaseEnd {
         VulkanBackend* self;
-        ~PhaseEnd() { self->Phase(6); }
+        ~PhaseEnd() {
+            self->defer_copies_ = false;  // queued copies are handed over in batches (CopyOut), or before a submission
+            self->Phase(6);
+        }
     };
 
     // Per-draw scratch storage (reused, so a draw allocates nothing). Draw only re-enters itself as
@@ -4117,6 +4476,7 @@ private:
         phase_timing_ = (drawn_ & 7) == 0;
         Phase(-1);
         PhaseEnd phase_end{this};
+        defer_copies_ = Async() && dsr::GetRuntime().config.recorder_copies;
         no_attachment_extent_ = {0, 0};
         if (p.count <= 0 || p.instances <= 0) return;
         if (!begin_rendering_ && !rp_fallback_) return Skip("no dynamic rendering");
@@ -4680,7 +5040,10 @@ private:
 
         Phase(5);
         // ---- queue the draw: the recorder thread builds its descriptor sets and records it --------------------
-        if (!EnsureRendering(colors, depth, &extent)) return Skip("no render target");
+        first_draw_ = {&p, fs, modes, depth != nullptr, shader_depth_test};
+        const bool rendering_ok = EnsureRendering(colors, depth, &extent);
+        first_draw_ = {};
+        if (!rendering_ok) return Skip("no render target");
         if (depth && fs->info.writes_depth && st_.depth.depth_write) depth->depth_exported = depth->fragdepth_written = true;
         DrawPacket d;
         d.pipeline = pipeline;
@@ -5009,19 +5372,17 @@ private:
             dk.Add(t.info.imageView);
             dk.Add(t.info.imageLayout);
         }
-        auto cached_sets = desc_cache_.find(dk.h);
-        bool reuse = cached_sets != desc_cache_.end();
-        if (!reuse) {
-            auto ps = persist_cache_.find(dk.h);
-            if (ps != persist_cache_.end()) {
-                cached_sets = desc_cache_.emplace(dk.h, ps->second).first;
-                reuse = true;
+        const std::pair<VkDescriptorSet, VkDescriptorSet>* cached_sets = desc_cache_.Find(dk.h);
+        if (!cached_sets) {
+            if (const auto* ps = persist_cache_.Find(dk.h)) {
+                cached_sets = &desc_cache_.Insert(dk.h, *ps);
                 persist_hits_++;
             }
         }
+        const bool reuse = cached_sets != nullptr;
         if (reuse) {
-            sets[0] = cached_sets->second.first;
-            sets[1] = cached_sets->second.second;
+            sets[0] = cached_sets->first;
+            sets[1] = cached_sets->second;
             desc_reused_++;
         } else {
             bool persistent = false;
@@ -5062,8 +5423,8 @@ private:
                 w.pImageInfo = &t.info;
             }
             if (n) vkUpdateDescriptorSets(device_, n, writes, 0, nullptr);
-            desc_cache_[dk.h] = {sets[0], sets[1]};
-            if (persistent) persist_cache_[dk.h] = {sets[0], sets[1]};
+            desc_cache_.Insert(dk.h, {sets[0], sets[1]});
+            if (persistent) persist_cache_.Insert(dk.h, {sets[0], sets[1]});
         }
 
         if (d.pipeline != bound_pipeline_) {
@@ -5197,7 +5558,17 @@ private:
         dyn_valid_ = true;
     }
 
+    int8_t vertex_format_ok_fast_[256] = {};  // 0 unknown, 1 yes, -1 no (Vulkan vertex formats are below 256)
     bool VertexFormatSupported(VkFormat f) {
+        if (uint32_t(f) < 256 && vertex_format_ok_fast_[f]) return vertex_format_ok_fast_[f] > 0;
+        if (uint32_t(f) < 256) {
+            VkFormatProperties p;
+            vkGetPhysicalDeviceFormatProperties(phys_, f, &p);
+            const bool ok = p.bufferFeatures & VK_FORMAT_FEATURE_VERTEX_BUFFER_BIT;
+            if (!ok) LOGW(kTag, "vertex format %d not supported by this GPU", int(f));
+            vertex_format_ok_fast_[f] = ok ? 1 : -1;
+            return ok;
+        }
         auto it = vertex_format_ok_.find(f);
         if (it != vertex_format_ok_.end()) return it->second;
         VkFormatProperties p;
@@ -5333,7 +5704,7 @@ private:
         if (j.result != VK_SUCCESS) LogOnce("pipeline", "vkCreateGraphicsPipelines failed: %d", j.result);
         const VkPipeline p = j.pipeline;
         pipelines_[e.first] = p;
-        if (p) pipelines_fast_[h] = p;
+        if (p) pipelines_fast_.Insert(h, p);
         compiling_.erase(h);
         return p;
     }
@@ -5358,8 +5729,7 @@ private:
         for (size_t i = 0; i < color_formats.size(); i++) fk.Add(&st_.blend[i], sizeof(BlendStateObj));
         fk.Add(layout);
         pipeline_pending_ = false;
-        auto fast = pipelines_fast_.find(fk.h);
-        if (fast != pipelines_fast_.end()) return fast->second;
+        if (const VkPipeline* fast = pipelines_fast_.Find(fk.h)) return *fast;
         auto running = compiling_.find(fk.h);
         if (running != compiling_.end()) {
             VkPipeline p = FinishCompile(fk.h, running->second);
@@ -5388,7 +5758,7 @@ private:
         for (size_t i = 0; i < color_formats.size(); i++) add(&st_.blend[i], sizeof(BlendStateObj));
         auto it = pipelines_.find(key);
         if (it != pipelines_.end()) {
-            pipelines_fast_[fk.h] = it->second;
+            pipelines_fast_.Insert(fk.h, it->second);
             return it->second;
         }
 
@@ -5476,7 +5846,7 @@ private:
             pipeline = j.pipeline;
             if (j.result != VK_SUCCESS) LogOnce("pipeline", "vkCreateGraphicsPipelines failed: %d", j.result);
             pipelines_[key] = pipeline;
-            if (pipeline) pipelines_fast_[fk.h] = pipeline;
+            if (pipeline) pipelines_fast_.Insert(fk.h, pipeline);
         }
         if (pipeline && pipelines_.size() <= 8)
             LOGI(kTag, "pipeline %zu: %zu attributes, %zu targets, depth format %d, topology %d, blend %s",
@@ -5500,13 +5870,23 @@ private:
             return isz == 2 ? reinterpret_cast<const uint16_t*>(ib)[i] : reinterpret_cast<const uint32_t*>(ib)[i];
         };
         uint64_t key = (addr * 0x9E3779B97F4A7C15ull) ^ (uint64_t(count) << 32) ^ isz;
+        // Within one list (one token: memory the list draws from does not change while it runs) the same index
+        // buffer is drawn several times (depth, shadow and colour passes): its range is taken from the first time,
+        // without sampling the buffer again.
+        const uint64_t memo_key = key;
+        if (const IndexMemo* m = index_memo_.Find(memo_key); m && m->token == geo_token_) {
+            *lo = m->lo;
+            *hi = m->hi;
+            return;
+        }
         const uint32_t step = std::max<uint32_t>(1, count / 16);
         for (uint32_t i = 0; i < count; i += step) key = (key ^ at(i)) * 0x100000001B3ull;
         key = (key ^ at(count - 1)) * 0x100000001B3ull;
-        auto it = index_ranges_.find(key);
-        if (it != index_ranges_.end()) {
-            *lo = it->second.first;
-            *hi = it->second.second;
+        if (const std::pair<uint32_t, uint32_t>* r = index_ranges_.Find(key)) {
+            *lo = r->first;
+            *hi = r->second;
+            if (index_memo_.size() > 100000) index_memo_.Clear();
+            index_memo_.Insert(memo_key, {r->first, r->second, geo_token_});
             return;
         }
         uint32_t mn = UINT32_MAX, mx = 0;
@@ -5515,8 +5895,10 @@ private:
             mn = std::min(mn, v);
             mx = std::max(mx, v);
         }
-        if (index_ranges_.size() > 200000) index_ranges_.clear();
-        index_ranges_[key] = {mn, mx};
+        if (index_ranges_.size() > 200000) index_ranges_.Clear();
+        index_ranges_.Insert(key, {mn, mx});
+        if (index_memo_.size() > 100000) index_memo_.Clear();
+        index_memo_.Insert(memo_key, {mn, mx, geo_token_});
         *lo = mn;
         *hi = mx;
     }
@@ -5560,7 +5942,7 @@ private:
     std::unique_ptr<PrehashJob[]> prehash_jobs_;
     size_t prehash_capacity_ = 0;
     std::atomic<size_t> prehash_count_{0};
-    std::unordered_map<uint64_t, size_t> prehash_index_;
+    FlatMap<size_t> prehash_index_;
     std::atomic<size_t> prehash_next_{0};
     std::atomic<int> prehash_active_{0};  // workers inside the job loop
     uint64_t prehash_generation_ = 0;     // under prehash_mutex_
@@ -5602,7 +5984,7 @@ private:
         while (prehash_active_.load() != 0) std::this_thread::yield();
         geo_used_prev_.swap(geo_used_now_);
         geo_used_now_.clear();
-        prehash_index_.clear();
+        prehash_index_.Clear();
         const size_t n = geo_used_prev_.size();
         if (n > prehash_capacity_) {
             prehash_jobs_.reset(new PrehashJob[n * 2]);
@@ -5610,14 +5992,14 @@ private:
         }
         size_t count = 0;
         for (uint64_t key : geo_used_prev_) {
-            auto it = geo_.find(key);
-            if (it == geo_.end() || it->second.changes >= 2 || !it->second.src) continue;
+            const GeoEntry* e = geo_.Find(key);
+            if (!e || e->changes >= 2 || !e->src) continue;
             PrehashJob& j = prehash_jobs_[count];
             j.key = key;
-            j.src = it->second.src;
-            j.size = it->second.size;
+            j.src = e->src;
+            j.size = e->size;
             j.done.store(false, std::memory_order_relaxed);
-            prehash_index_[key] = count;
+            prehash_index_.Insert(key, count);
             count++;
         }
         prehash_count_.store(count);
@@ -5628,7 +6010,7 @@ private:
         }
         prehash_cv_.notify_all();
     }
-    std::unordered_map<uint64_t, GeoEntry> geo_;
+    FlatMap<GeoEntry> geo_;
     // Geometry content is checked once per token: a new token with each list, and whenever the list itself
     // writes game memory (buffer-to-buffer copies, inline buffer updates). Draws after such a write in the same
     // list used the copy checked before it: stale particle quads (holes in smoke and dust). Hashes made ahead
@@ -5637,7 +6019,8 @@ private:
     uint64_t list_b2b_copies_ = 0, list_updates_ = 0;
     uintptr_t geo_lo_ = UINTPTR_MAX, geo_hi_ = 0;  // span of the geometry checked under the current token
     void MemoryWrittenInList(uint64_t addr, uint64_t size) {
-        stream_cache_.clear();
+        stream_cache_.Clear();
+        index_memo_.Clear();
         if (addr < geo_hi_ && addr + size > geo_lo_) {
             geo_token_++;
             geo_lo_ = UINTPTR_MAX;
@@ -5660,8 +6043,7 @@ private:
         if (vkCreateBuffer(device_, &bi, nullptr, &geo_buf_) != VK_SUCCESS) goto fail;
         vkGetBufferMemoryRequirements(device_, geo_buf_, &req);
         ai.allocationSize = req.size;
-        ai.memoryTypeIndex =
-            FindMemory(req.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+        ai.memoryTypeIndex = StagingMemory(req.memoryTypeBits);
         if (vkAllocateMemory(device_, &ai, nullptr, &geo_mem_) != VK_SUCCESS) goto fail;
         vkBindBufferMemory(device_, geo_buf_, geo_mem_, 0);
         if (vkMapMemory(device_, geo_mem_, 0, kGeoSize, 0, &p) != VK_SUCCESS) goto fail;
@@ -5720,14 +6102,14 @@ private:
     VkDeviceSize GeoCached(const uint8_t* src, size_t size) {
         if (size == 0 || size > (16u << 20) || !EnsureGeo()) return VK_WHOLE_SIZE;
         const uint64_t key = (uint64_t(reinterpret_cast<uintptr_t>(src)) * 0x9E3779B97F4A7C15ull) ^ uint64_t(size);
-        auto it = geo_.find(key);
-        if (it != geo_.end() && it->second.changes >= 2) {
+        GeoEntry* it = geo_.Find(key);
+        if (it && it->changes >= 2) {
             geo_volatile_++;
             return VK_WHOLE_SIZE;  // rewritten every frame or so: streamed with the list
         }
-        if (it != geo_.end() && it->second.checked_list == geo_token_) {
+        if (it && it->checked_list == geo_token_) {
             geo_hits_++;
-            return it->second.off;
+            return it->off;
         }
         geo_used_now_.push_back(key);
         geo_lo_ = std::min(geo_lo_, reinterpret_cast<uintptr_t>(src));
@@ -5736,26 +6118,25 @@ private:
         // game reused for another mesh of the same size) for a few frames: flickering textures. The hash usually
         // comes from a worker thread (hashed at the start of the list).
         uint64_t h;
-        auto pre = prehash_index_.find(key);
-        if (pre != prehash_index_.end() && geo_token_ == geo_token_list_ &&
-            prehash_jobs_[pre->second].done.load(std::memory_order_acquire) &&
-            prehash_jobs_[pre->second].src == src) {
-            h = prehash_jobs_[pre->second].hash;
+        const size_t* pre = prehash_index_.Find(key);
+        if (pre && geo_token_ == geo_token_list_ && prehash_jobs_[*pre].done.load(std::memory_order_acquire) &&
+            prehash_jobs_[*pre].src == src) {
+            h = prehash_jobs_[*pre].hash;
             prehash_used_++;
         } else {
             h = GeoHash(src, size);
             prehash_inline_++;
         }
-        if (it != geo_.end() && it->second.hash == h) {
+        if (it && it->hash == h) {
             geo_hits_++;
-            it->second.checked_list = geo_token_;
-            it->second.interval = std::min<uint32_t>(it->second.interval * 2, 8);
-            it->second.next_check_list = list_counter_ + it->second.interval;
-            return it->second.off;
+            it->checked_list = geo_token_;
+            it->interval = std::min<uint32_t>(it->interval * 2, 8);
+            it->next_check_list = list_counter_ + it->interval;
+            return it->off;
         }
-        const uint32_t changes = it != geo_.end() ? it->second.changes + 1 : 0;
+        const uint32_t changes = it ? it->changes + 1 : 0;
         if (changes >= 2) {
-            it->second.changes = changes;
+            it->changes = changes;
             geo_volatile_++;
             return VK_WHOLE_SIZE;
         }
@@ -5764,19 +6145,19 @@ private:
             // Full: start over once the GPU no longer reads any of it.
             Flush();
             WaitGpuIdle();
-            geo_.clear();
+            geo_.Clear();
             geo_off_ = 0;
             geo_resets_++;
             InvalidateBoundState();
-            it = geo_.end();
+            it = nullptr;
         }
         const VkDeviceSize off = geo_off_;
         geo_off_ += need;
-        memcpy(geo_ptr_ + off, src, size);
+        CopyOut(geo_ptr_ + off, src, size);
         geo_misses_++;
         geo_bytes_ += size;
         // A changed range gets new space (the old copy may still be read by frames in flight).
-        geo_[key] = {h, off, changes, list_counter_ + 1, 1, geo_token_, src, size};
+        geo_.Insert(key, {h, off, changes, list_counter_ + 1, 1, geo_token_, src, size});
         return off;
     }
 
@@ -5809,19 +6190,111 @@ private:
         memset(dst + avail, 0, size_t(bytes - avail));
         return off;
     }
+    // ---- copies done on a worker thread ----------------------------------------------------------------------
+    // A draw's uniform and vertex data is copied from game memory into the stream / geometry cache. The render
+    // thread finds the place (cache lookups, allocation, flush decisions) and hands the copying to a worker; the
+    // recorder waits for the copies of a slot before it submits the slot. Game memory must not change before the
+    // worker has copied it: the render thread waits for the worker before it writes game memory itself (in-list
+    // buffer copies and updates) and at the end of each list, after which the game may reuse the memory (its syncs
+    // signal). (Copying on the recorder itself made that end-of-list wait cover the recorder's whole backlog.)
+    struct PendingCopy {
+        uint8_t* dst;
+        const uint8_t* src;
+        size_t size;
+    };
+    std::vector<PendingCopy> pending_copies_;  // render thread: this draw's
+    bool defer_copies_ = false;                // inside Draw, recorder running
+    uint64_t deferred_bytes_ = 0, deferred_copies_ = 0;
+    std::mutex copy_mutex_;
+    std::condition_variable copy_cv_;
+    std::deque<std::vector<PendingCopy>> copy_queue_;  // under copy_mutex_
+    std::vector<std::vector<PendingCopy>> copy_free_;  // spent batches (their capacity is reused)
+    uint64_t copy_batches_queued_ = 0;                 // render thread
+    std::atomic<uint64_t> copy_batches_done_{0};
+    bool copy_started_ = false;
+    void CopyWorker() {
+        pthread_setname_np(pthread_self(), "dsr-copy");
+        dsr::platform::PreferFastCores("copy thread");
+        for (;;) {
+            std::vector<PendingCopy> batch;
+            {
+                std::unique_lock<std::mutex> lk(copy_mutex_);
+                copy_cv_.wait(lk, [&] { return !copy_queue_.empty(); });
+                batch.swap(copy_queue_.front());
+                copy_queue_.pop_front();
+            }
+            for (const PendingCopy& c : batch) memcpy(c.dst, c.src, c.size);
+            batch.clear();
+            {
+                std::lock_guard<std::mutex> lk(copy_mutex_);
+                copy_free_.push_back(std::move(batch));
+            }
+            copy_batches_done_.fetch_add(1, std::memory_order_release);
+        }
+    }
+    void CopyOut(uint8_t* dst, const uint8_t* src, size_t size) {
+        if (defer_copies_ && size >= 64) {
+            pending_copies_.push_back({dst, src, size});
+            deferred_bytes_ += size;
+            deferred_copies_++;
+            // Handed over in batches: one per draw (a lock and a thread wake-up each) cost the render thread more
+            // than the copies. Copies kept back are handed over before any submission, wait or game-memory write.
+            if (pending_copies_.size() >= 256) EmitPendingCopies();
+        } else {
+            memcpy(dst, src, size);
+        }
+    }
+    void EmitPendingCopies() {
+        if (pending_copies_.empty()) return;
+        if (!Async()) {
+            for (const PendingCopy& c : pending_copies_) memcpy(c.dst, c.src, c.size);
+            pending_copies_.clear();
+            return;
+        }
+        if (!copy_started_) {
+            copy_started_ = true;
+            std::thread([this] { CopyWorker(); }).detach();
+        }
+        std::vector<PendingCopy> batch;
+        {
+            std::lock_guard<std::mutex> lk(copy_mutex_);
+            if (!copy_free_.empty()) {
+                batch.swap(copy_free_.back());
+                copy_free_.pop_back();
+            }
+            batch.swap(pending_copies_);  // pending_copies_ keeps the spent batch's capacity
+            copy_queue_.push_back(std::move(batch));
+        }
+        copy_batches_queued_++;
+        copy_cv_.notify_one();
+    }
+    // Spins until the worker has done batch `target` (short: memcpy only).
+    void WaitCopies(uint64_t target) {
+        if (copy_batches_done_.load(std::memory_order_acquire) >= target) return;
+        MsTimer t(copy_wait_ms_);
+        for (int i = 0; copy_batches_done_.load(std::memory_order_acquire) < target; i++) {
+            if ((i & 1023) == 1023) std::this_thread::yield();
+            else CpuRelax();
+        }
+    }
+    double copy_wait_ms_ = 0;
+    // Before the render thread writes game memory, and at the end of a list: every queued copy is done.
+    void FinishCopies() {
+        EmitPendingCopies();
+        WaitCopies(copy_batches_queued_);
+    }
     VkDeviceSize UploadCached(const uint8_t* src, size_t size, VkDeviceSize align) {
         const uint64_t key = (uint64_t(reinterpret_cast<uintptr_t>(src)) * 0x9E3779B97F4A7C15ull) ^ (uint64_t(size) << 1) ^ align;
-        auto it = stream_cache_.find(key);
-        if (it != stream_cache_.end()) {
+        if (const VkDeviceSize* hit = stream_cache_.Find(key)) {
             upload_hits_++;
-            return it->second;
+            return *hit;
         }
         bool flushed = false;
         VkDeviceSize off = StreamAlloc(size, align, &flushed);
         if (off == VK_WHOLE_SIZE) return off;
-        memcpy(stream_ptr_ + off, src, size);
+        CopyOut(stream_ptr_ + off, src, size);
         upload_bytes_ += size;
-        stream_cache_[key] = off;
+        stream_cache_.Insert(key, off);
         return off;
     }
 
@@ -5921,11 +6394,18 @@ private:
             LOGI(kTag, "textures that broke a render pass to become readable:%s", top.c_str());
             sampled_breaks_.clear();
         }
-        LOGI(kTag, "last 10 s: %.0f ms executing lists (%.0f ms of it waiting for the GPU), %.1f MB streamed, %llu cached uploads",
-             exec_ms_, wait_ms_, upload_bytes_ / 1048576.0, (unsigned long long)upload_hits_);
-        LOGI(kTag, "GPU busy %.0f ms in the last 10 s (%.1f ms per list); geometry hashed ahead: %llu of %llu checks",
+        LOGI(kTag, "last 10 s: %.0f ms executing lists (%.0f ms of it waiting for the GPU), %.1f MB streamed, %llu cached uploads; "
+             "copied on the copy thread: %llu copies, %.1f MB (render thread waited %.0f ms for it)",
+             exec_ms_, wait_ms_, upload_bytes_ / 1048576.0, (unsigned long long)upload_hits_,
+             (unsigned long long)deferred_copies_, deferred_bytes_ / 1048576.0, copy_wait_ms_);
+        deferred_copies_ = 0;
+        deferred_bytes_ = 0;
+        copy_wait_ms_ = 0;
+        LOGI(kTag, "GPU busy %.0f ms in the last 10 s (%.1f ms per list); geometry hashed ahead: %llu of %llu checks%s",
              gpu_busy_ms_, list_counter_ > stat_lists_ ? gpu_busy_ms_ / double(list_counter_ - stat_lists_) : 0.0,
-             (unsigned long long)prehash_used_, (unsigned long long)(prehash_used_ + prehash_inline_));
+             (unsigned long long)prehash_used_, (unsigned long long)(prehash_used_ + prehash_inline_),
+             fence_retries_ ? ("; GPU fence waits repeated: " + std::to_string(fence_retries_)).c_str() : "");
+        fence_retries_ = 0;
         gpu_busy_ms_ = 0;
         stat_lists_ = list_counter_;
         prehash_used_ = prehash_inline_ = 0;
@@ -5952,6 +6432,17 @@ private:
              (unsigned long long)clears_deferred_, (unsigned long long)clears_in_pass_, (unsigned long long)clears_flushed_,
              (unsigned long long)pass_barriers_, (unsigned long long)lrz_touches_, (unsigned long long)shader_depth_draws_);
         clears_deferred_ = clears_in_pass_ = clears_flushed_ = pass_barriers_ = lrz_touches_ = shader_depth_draws_ = 0;
+        if (load_skip_ && loads_skipped_) {
+            LOGI(kTag, "render target loads skipped (passes whose first draw overwrites them): %llu",
+                 (unsigned long long)loads_skipped_);
+            loads_skipped_ = 0;
+        }
+        if (bg_levels_ || bg_dropped_) {
+            LOGI(kTag, "background texture conversion: %llu levels in %.0f ms, %llu dropped (texture replaced)",
+                 (unsigned long long)bg_levels_, bg_ms_, (unsigned long long)bg_dropped_);
+            bg_levels_ = bg_dropped_ = 0;
+            bg_ms_ = 0;
+        }
         if (rt_writebacks_ || reports_done_) {
             LOGI(kTag, "small render targets written back to game memory: %llu; reports written: %llu",
                  (unsigned long long)rt_writebacks_, (unsigned long long)reports_done_);
@@ -6213,7 +6704,7 @@ private:
     VkDeviceMemory stream_memory_ = VK_NULL_HANDLE;
     uint8_t* stream_ptr_ = nullptr;
     VkDeviceSize stream_off_ = 0, zero_offset_ = 0;
-    std::unordered_map<uint64_t, VkDeviceSize> stream_cache_;
+    FlatMap<VkDeviceSize> stream_cache_;
     uint64_t upload_hits_ = 0, upload_bytes_ = 0;
     uint64_t depth_gen_ = 0;
     // HUD box for other aspect ratios (see Draw): size, 0 = off.
@@ -6342,7 +6833,12 @@ private:
     std::vector<CaptureItem> capture_items_;
     VkExtent2D no_attachment_extent_{0, 0};  // render area for a draw with no attachments (storage-only)
     uint64_t fast_draws_ = 0, big_checks_ = 0, big_changes_ = 0;
-    std::unordered_map<uint64_t, std::pair<uint32_t, uint32_t>> index_ranges_;
+    FlatMap<std::pair<uint32_t, uint32_t>> index_ranges_;
+    struct IndexMemo {
+        uint32_t lo, hi;
+        uint64_t token;  // geo_token_ it was found under
+    };
+    FlatMap<IndexMemo> index_memo_;
     VkPipelineCache pipeline_cache_ = VK_NULL_HANDLE;
     int new_pipelines_ = 0;
     double compile_ms_ = 0;
@@ -6410,17 +6906,17 @@ private:
     int slot_ = 0;      // render thread: the slot being filled
     int rec_slot_ = 0;  // recorder: the slot whose descriptor pools it allocates from
     // Hashed fronts of the caches above (no allocation per lookup).
-    std::unordered_map<uint64_t, VkSampler> samplers_fast_;
-    std::unordered_map<uint64_t, Shader*> shaders_fast_;
-    std::unordered_map<uint64_t, VkPipeline> pipelines_fast_;
+    FlatMap<VkSampler> samplers_fast_;
+    FlatMap<Shader*> shaders_fast_;
+    FlatMap<VkPipeline> pipelines_fast_;
     std::unordered_map<uint64_t, std::pair<std::vector<uint32_t>, VkDescriptorSetLayout>> set_layouts_fast_;
     VkDescriptorSetLayout last_pl_vs_ = VK_NULL_HANDLE, last_pl_fs_ = VK_NULL_HANDLE;
     VkPipelineLayout last_pl_ = VK_NULL_HANDLE;
-    std::unordered_map<uint64_t, std::pair<VkDescriptorSet, VkDescriptorSet>> desc_cache_;
+    FlatMap<std::pair<VkDescriptorSet, VkDescriptorSet>> desc_cache_;
     // Descriptor sets kept across lists (most draws bind the same textures frame after frame): their own pool,
     // emptied when an image is destroyed (the GPU is idle then) or when it is full.
     VkDescriptorPool persist_pool_ = VK_NULL_HANDLE;
-    std::unordered_map<uint64_t, std::pair<VkDescriptorSet, VkDescriptorSet>> persist_cache_;
+    FlatMap<std::pair<VkDescriptorSet, VkDescriptorSet>> persist_cache_;
     uint64_t persist_hits_ = 0, persist_resets_ = 0;
     uint64_t desc_reused_ = 0;
     VkPipeline bound_pipeline_ = VK_NULL_HANDLE;
@@ -6442,6 +6938,7 @@ private:
     // diagnostics
     uint64_t last_video_present_ = 0, video_cadence_[5] = {};
     uint64_t presented_ = 0, drawn_ = 0, list_counter_ = 0, reuploads_ = 0;
+    uint64_t image_serial_ = 0;
     int swapchains_created_ = 0, images_created_ = 0, clear_colors_logged_ = 0, copies_logged_ = 0,
         target_sets_logged_ = 0, shaders_translated_ = 0, shader_failures_logged_ = 0, uploads_ = 0, flushes_ = 0,
         b2t_logged_ = 0, constants_logged_ = 0, handles_logged_ = 0;

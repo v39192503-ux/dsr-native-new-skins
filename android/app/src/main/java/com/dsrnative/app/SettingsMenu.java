@@ -429,9 +429,11 @@ public final class SettingsMenu {
 
     private void buildGraphicsTab() {
         section(Strings.t("sec_display"));
-        choice("fps", Strings.t("fps_t"), Strings.t("fps_auto_n") + " " + Strings.t("changes_now"),
-                new String[] {"30", "45", "60", "auto"},
-                new String[] {"30 fps", "45 fps", "60 fps", Strings.t("fps_auto")}, "60");
+        choice("fps", Strings.t("fps_t"), Strings.t("fps_auto_n") + " "
+                        + Strings.t("fps_unl_n", Math.max(60, Math.min(144, GameActivity.displayMaxHz()))) + " "
+                        + Strings.t("changes_now"),
+                new String[] {"30", "45", "60", "auto", "unlocked"},
+                new String[] {"30 fps", "45 fps", "60 fps", Strings.t("fps_auto"), Strings.t("fps_unl")}, "60");
         choice("present_mode", Strings.t("present_t"), Strings.t("changes_next"),
                 new String[] {"fifo", "mailbox"},
                 new String[] {Strings.t("present_vsync") + " " + Strings.t("default_mark"), Strings.t("present_mailbox")},
@@ -448,6 +450,8 @@ public final class SettingsMenu {
         toggle("performance_mode", Strings.t("perf_t"), Strings.t("perf_n") + " " + Strings.t("changes_next"), "1", "0",
                 "0");
         renderScale();  // performance mode sets 75%; it can be moved freely afterwards
+        toggle("lighter_post_fx", Strings.t("post_t"), Strings.t("post_n") + " " + Strings.t("changes_next"), "1", "0",
+                "0");
 
         section(Strings.t("sec_gpu"));
         note(Strings.t("gpu_n"));
@@ -459,6 +463,14 @@ public final class SettingsMenu {
     }
 
     // ---- Driver tab ---------------------------------------------------------------------------------------------
+
+    // Drivers that come with the app (assets/drivers/<name>.zip; the native side copies them out of the APK).
+    private static final String[] BUNDLED_DRIVERS = {"Turnip_Gen8_V39"};
+
+    private static boolean isBundledDriver(String d) {
+        for (String b : BUNDLED_DRIVERS) if (b.equals(d)) return true;
+        return false;
+    }
 
     private static String driverLabel(String d) {
         return d == null || d.isEmpty() || d.equals("system") ? Strings.t("system_driver") : d;
@@ -473,6 +485,7 @@ public final class SettingsMenu {
         if (chosen == null || chosen.isEmpty()) chosen = "system";
         List<String> drivers = new ArrayList<>();
         drivers.add("system");
+        for (String b : BUNDLED_DRIVERS) drivers.add(b);
         File dir = new File(sDriversDir);
         File[] files = dir.listFiles();
         if (files != null) {
@@ -488,7 +501,8 @@ public final class SettingsMenu {
         for (final String d : drivers) {
             String label = d.equals("system") ? Strings.t("system_driver") + " " + Strings.t("default_mark") : d;
             if (d.equals(sRunningDriver)) label += "   • " + Strings.t("mark_in_use");
-            if (!d.equals("system") && !new File(dir, d).isFile()) label += "   • " + Strings.t("mark_missing");
+            if (!d.equals("system") && !isBundledDriver(d) && !new File(dir, d).isFile())
+                label += "   • " + Strings.t("mark_missing");
             final TextView row = chip(label, false);
             row.setSelected(d.equals(chosen));
             row.setGravity(Gravity.CENTER_VERTICAL | Gravity.START);
@@ -1310,17 +1324,21 @@ public final class SettingsMenu {
      * texture_mip_skip and turns it on; off: puts the remembered values back.
      */
     private void performanceScale(boolean on) {
-        if (on && gpuLacksBc()) {
-            String mip = mValues.containsKey("texture_mip_skip") ? mValues.get("texture_mip_skip") : "0";
-            writeSetting("texture_mip_skip_before_perf", mip);
-            mValues.put("texture_mip_skip_before_perf", mip);
-            if (writeSetting("texture_mip_skip", "1")) mValues.put("texture_mip_skip", "1");
-        } else if (!on) {
-            String before = mValues.get("texture_mip_skip_before_perf");
-            if (before != null && !before.isEmpty()) {  // performance mode had turned it on: restored
-                if (writeSetting("texture_mip_skip", before)) mValues.put("texture_mip_skip", before);
-                writeSetting("texture_mip_skip_before_perf", "");
-                mValues.put("texture_mip_skip_before_perf", "");
+        // On GPUs without BC support (the weaker ones: Mali), performance mode also turns on texture mip skip and
+        // lighter post-processing; turning it off puts back what they were.
+        for (String key : new String[] {"texture_mip_skip", "lighter_post_fx"}) {
+            if (on && gpuLacksBc()) {
+                String was = mValues.containsKey(key) ? mValues.get(key) : "0";
+                writeSetting(key + "_before_perf", was);
+                mValues.put(key + "_before_perf", was);
+                if (writeSetting(key, "1")) mValues.put(key, "1");
+            } else if (!on) {
+                String before = mValues.get(key + "_before_perf");
+                if (before != null && !before.isEmpty()) {  // performance mode had turned it on: restored
+                    if (writeSetting(key, before)) mValues.put(key, before);
+                    writeSetting(key + "_before_perf", "");
+                    mValues.put(key + "_before_perf", "");
+                }
             }
         }
         String cur = mValues.containsKey("render_scale") ? mValues.get("render_scale") : "1.00";

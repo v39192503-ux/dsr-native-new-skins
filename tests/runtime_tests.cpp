@@ -574,15 +574,15 @@ static void TestEtcEncode() {
             p[2] = uint8_t(((x ^ y) & 8) ? 220 : 30);
             p[3] = ((x / 3 + y / 5) % 3 == 0) ? 0 : 255;
         }
-    for (int mode = 0; mode < 3; mode++) {
-        const bool punch = mode == 1, rgba = mode == 2;
+    for (int mode = 0; mode < 6; mode++) {  // 3..5: the quick (preview) encode
+        const bool punch = mode % 3 == 1, rgba = mode % 3 == 2, quick = mode >= 3;
         const int bpb = rgba ? 16 : 8, bxn = (W + 3) / 4, byn = (H + 3) / 4;
         std::vector<uint8_t> out(size_t(bxn) * byn * bpb);
         CHECK(out.size() == (rgba ? EtcRgba8LevelBytes(W, H, 1) : EtcLevelBytes(W, H, 1)));
         if (rgba)
-            EncodeEtc2Rgba8(out.data(), img.data(), W, H, 1);
+            EncodeEtc2Rgba8(out.data(), img.data(), W, H, 1, quick);
         else
-            EncodeEtc2Rgb(out.data(), img.data(), W, H, 1, punch);
+            EncodeEtc2Rgb(out.data(), img.data(), W, H, 1, punch, quick);
         double se = 0;
         long n = 0;
         int alpha_wrong = 0;
@@ -609,7 +609,8 @@ static void TestEtcEncode() {
                     }
             }
         CHECK(alpha_wrong == 0);
-        CHECK(n > 0 && se / n < 40.0 * 40.0 / 4);  // PSNR above ~28 dB on this noisy, hard-edged picture
+        // PSNR above ~28 dB on this noisy, hard-edged picture (quick: ~24 dB)
+        CHECK(n > 0 && se / n < (quick ? 64.0 * 64.0 / 4 : 40.0 * 40.0 / 4));
     }
     std::vector<int> hits(1000);
     WorkPool::Get().Run(hits.size(), [&](size_t i) { hits[i]++; });

@@ -1,5 +1,6 @@
 #include "common/platform.h"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -65,6 +66,9 @@ struct Watched {
     pid_t tid;
     std::string who;
     int restores = 0;
+    // Back-off: the next check, and the wait after a restore the system undid at once or refused (see WatchAffinity).
+    std::chrono::steady_clock::time_point next_check{}, last_restore{}, calm_since{};
+    int backoff_ms = 0;
 };
 std::mutex g_watch_mutex;
 std::vector<Watched> g_watched;
@@ -162,14 +166,22 @@ void WatchAffinity() {
     const FastCores& fc = GetFastCores();
     // Checked 10 times a second: on the OnePlus 6T the system reset the affinity about once a second, so with
     // a one-second check the threads still spent much of their time on the efficiency cores.
-    int restored = 0, refused = 0;
+    // Back-off: some phones fight back. The 6T (Android 11) undid the restore again within a second, hundreds of times
+    // per 10 s, and more and more often refused it (the performance cores taken away from the app: thermal / core
+    // control), its threads moving every time. A thread whose restore was refused, or undone within a second, is
+    // left where the system put it for a while: 200 ms, doubling up to 5 s each time it happens again; after 10 s
+    // without a fight it is watched every 100 ms again.
+    constexpr int kMinBackoffMs = 200, kMaxBackoffMs = 5000;
+    using clock = std::chrono::steady_clock;
+    int restored = 0, refused = 0, backoffs = 0;
     std::string why;
     bool why_logged = false;
-    auto summary_at = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    auto summary_at = clock::now() + std::chrono::seconds(10);
     for (;;) {
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
         WaitWhilePaused();  // in the background the system moves threads as it likes: nothing to restore
         std::lock_guard<std::mutex> lk(g_watch_mutex);
+        const auto now = clock::now();
         pid_t refused_tid = 0;
         for (size_t i = 0; i < g_watched.size();) {
             Watched& w = g_watched[i];
@@ -179,26 +191,41 @@ void WatchAffinity() {
                 g_watched.erase(g_watched.begin() + long(i));
                 continue;
             }
-            if (!CPU_EQUAL(&cur, &fc.set)) {
-                const int r = sched_setaffinity(w.tid, sizeof(fc.set), &fc.set);
-                (r == 0 ? restored : refused)++;
-                if (r != 0 && !refused_tid) refused_tid = w.tid;
-                if (++w.restores <= 2)
-                    LOGI("platform", "%s (tid %d): CPU affinity reset by the system (%d CPUs allowed, cpuset %s), "
-                         "restored to CPUs%s: %s", w.who.c_str(), int(w.tid), CPU_COUNT(&cur),
-                         CpusetOf(w.tid).c_str(), fc.list.c_str(), r == 0 ? "ok" : "refused");
-            }
             i++;
+            if (now < w.next_check) continue;
+            if (CPU_EQUAL(&cur, &fc.set)) {
+                if (w.backoff_ms && now - w.calm_since > std::chrono::seconds(10)) w.backoff_ms = 0;
+                continue;
+            }
+            // Undone within a second of our last restore: the system is fighting it.
+            const bool fight = w.last_restore != clock::time_point{} && now - w.last_restore < std::chrono::seconds(1);
+            const int r = sched_setaffinity(w.tid, sizeof(fc.set), &fc.set);
+            (r == 0 ? restored : refused)++;
+            if (r != 0 && !refused_tid) refused_tid = w.tid;
+            if (++w.restores <= 2)
+                LOGI("platform", "%s (tid %d): CPU affinity reset by the system (%d CPUs allowed, cpuset %s), "
+                     "restored to CPUs%s: %s", w.who.c_str(), int(w.tid), CPU_COUNT(&cur), CpusetOf(w.tid).c_str(),
+                     fc.list.c_str(), r == 0 ? "ok" : "refused");
+            if (r == 0) w.last_restore = now;
+            if (r != 0 || fight) {
+                w.backoff_ms = w.backoff_ms ? std::min(w.backoff_ms * 2, kMaxBackoffMs) : kMinBackoffMs;
+                w.next_check = now + std::chrono::milliseconds(w.backoff_ms);
+                w.calm_since = w.next_check;
+                backoffs++;
+            }
         }
         if (refused_tid && !why_logged) why = WhyRefused(refused_tid), why_logged = true;
-        if (std::chrono::steady_clock::now() >= summary_at) {
+        if (now >= summary_at) {
             summary_at += std::chrono::seconds(10);
-            if (restored || refused)
+            if (restored || refused) {
+                int longest = 0;
+                for (const Watched& w : g_watched) longest = std::max(longest, w.backoff_ms);
                 LOGI("platform", "CPU affinity of the busy threads reset by the system and restored %d times in the "
-                     "last 10 s (%d refused: none of CPUs%s online/allowed); CPUs now: %s", restored, refused,
-                     fc.list.c_str(), CpuState().c_str());
+                     "last 10 s (%d refused: none of CPUs%s online/allowed; %d back-offs, longest now %d ms); CPUs now: %s",
+                     restored, refused, fc.list.c_str(), backoffs, longest, CpuState().c_str());
+            }
             if (refused && !why.empty()) LOGI("platform", "refused: %s", why.c_str());
-            restored = refused = 0;
+            restored = refused = backoffs = 0;
             why.clear();
             why_logged = false;
         }

@@ -53,7 +53,8 @@ inline int Expand4(int v) { return v * 17; }
 inline int Expand5(int v) { return (v << 3) | (v >> 2); }
 
 // Best table and per-pixel codes for one subblock with the given base colour; returns the squared error.
-int SolveSubblock(const Texel t[16], int flip, int s, const int base[3], Mode mode, int codes[16], int* table_out) {
+int SolveSubblock(const Texel t[16], int flip, int s, const int base[3], Mode mode, int codes[16], int* table_out,
+                  bool quick = false) {
     // Only tables whose large modifier matches the subblock's colour range are worth trying.
     int lo[3] = {255, 255, 255}, hi[3] = {0, 0, 0};
     for (int i = 0; i < 16; i++) {
@@ -71,7 +72,7 @@ int SolveSubblock(const Texel t[16], int flip, int s, const int base[3], Mode mo
             first = k;
             break;
         }
-    const int from = std::max(0, first - 1), to = std::min(7, first + 1);
+    const int from = quick ? first : std::max(0, first - 1), to = quick ? first : std::min(7, first + 1);
 
     int best_err = std::numeric_limits<int>::max(), best_table = from;
     int best_codes[16] = {};
@@ -196,6 +197,35 @@ uint64_t EncodeBlock(const Texel t[16], bool punch) {
     return best_word;
 }
 
+// A quick, coarser block (texture previews while the full encode runs in the background): left/right subblocks in
+// differential mode (the second colour brought within reach of the first), one table per subblock.
+uint64_t EncodeBlockQuick(const Texel t[16], bool punch) {
+    bool any_transparent = false;
+    for (int i = 0; i < 16; i++) any_transparent |= t[i].transparent;
+    const Mode mode = any_transparent ? Mode::NonOpaque : Mode::Normal;
+    int base_code[2][3], base_rgb[2][3];
+    for (int s = 0; s < 2; s++) {
+        int avg[3];
+        SubblockAverage(t, 0, s, avg);
+        for (int c = 0; c < 3; c++) base_code[s][c] = std::min(31, (avg[c] * 31 + 127) / 255);
+    }
+    for (int c = 0; c < 3; c++)
+        base_code[1][c] = base_code[0][c] + std::clamp(base_code[1][c] - base_code[0][c], -4, 3);
+    for (int s = 0; s < 2; s++)
+        for (int c = 0; c < 3; c++) base_rgb[s][c] = Expand5(base_code[s][c]);
+    int codes[16] = {}, tables[2] = {0, 0};
+    for (int s = 0; s < 2; s++) SolveSubblock(t, 0, s, base_rgb[s], mode, codes, &tables[s], true);
+    uint64_t v = 0;
+    for (int c = 0; c < 3; c++) {
+        v |= uint64_t(base_code[0][c]) << (59 - 8 * c);
+        v |= uint64_t((base_code[1][c] - base_code[0][c]) & 7) << (56 - 8 * c);
+    }
+    if (!punch || mode == Mode::Normal) v |= uint64_t(1) << 33;
+    v |= uint64_t(tables[0]) << 37;
+    v |= uint64_t(tables[1]) << 34;
+    return PackCodes(v, codes);
+}
+
 void StoreBigEndian(uint8_t* out, uint64_t v) {
     for (int k = 0; k < 8; k++) out[k] = uint8_t(v >> (56 - 8 * k));
 }
@@ -317,6 +347,26 @@ void EncodeEacBlock(uint8_t* out, const uint8_t a[16]) {
     StoreEac(out, bb, bm, bt, idx);
 }
 
+// One table, the multiplier whose span covers the range and the centred base (previews).
+void EncodeEacBlockQuick(uint8_t* out, const uint8_t a[16]) {
+    int lo = 255, hi = 0;
+    for (int i = 0; i < 16; i++) {
+        lo = std::min(lo, int(a[i]));
+        hi = std::max(hi, int(a[i]));
+    }
+    int idx[16];
+    if (lo == hi) {
+        for (int& v : idx) v = kEacFlatIndex;
+        StoreEac(out, lo, 1, kEacFlatTable, idx);
+        return;
+    }
+    constexpr int t = 11;  // {-2, -5, -7, -10, 1, 4, 6, 9}: evenly spread
+    const int m = std::clamp((hi - lo + 18) / 19, 1, 15);
+    const int b = ClampByte(int((lo + hi) * 0.5 + m * 0.5 + 0.5));
+    EacTry(a, t, m, b, idx);
+    StoreEac(out, b, m, t, idx);
+}
+
 }  // namespace
 
 bool IsEtcEncodable(int f) { return f == 65 || f == 66 || f == 69 || f == 70; }
@@ -328,7 +378,8 @@ size_t EtcLevelBytes(int width, int height, int depth) {
 }
 size_t EtcRgba8LevelBytes(int width, int height, int depth) { return EtcLevelBytes(width, height, depth) * 2; }
 
-void EncodeEtc2Rgb(uint8_t* out, const uint8_t* rgba, int width, int height, int depth, bool punch_through) {
+void EncodeEtc2Rgb(uint8_t* out, const uint8_t* rgba, int width, int height, int depth, bool punch_through,
+                   bool quick) {
     const int bxn = (width + 3) / 4, byn = (height + 3) / 4;
     for (int z = 0; z < std::max(1, depth); z++) {
         const uint8_t* slice = rgba + size_t(z) * size_t(width) * size_t(height) * 4;
@@ -336,12 +387,13 @@ void EncodeEtc2Rgb(uint8_t* out, const uint8_t* rgba, int width, int height, int
             for (int bx = 0; bx < bxn; bx++) {
                 Texel t[16];
                 GatherBlock(slice, width, height, bx, by, punch_through, t);
-                StoreBigEndian(out + ((size_t(z) * byn + by) * bxn + bx) * 8, EncodeBlock(t, punch_through));
+                StoreBigEndian(out + ((size_t(z) * byn + by) * bxn + bx) * 8,
+                               quick ? EncodeBlockQuick(t, punch_through) : EncodeBlock(t, punch_through));
             }
     }
 }
 
-void EncodeEtc2Rgba8(uint8_t* out, const uint8_t* rgba, int width, int height, int depth) {
+void EncodeEtc2Rgba8(uint8_t* out, const uint8_t* rgba, int width, int height, int depth, bool quick) {
     const int bxn = (width + 3) / 4, byn = (height + 3) / 4;
     for (int z = 0; z < std::max(1, depth); z++) {
         const uint8_t* slice = rgba + size_t(z) * size_t(width) * size_t(height) * 4;
@@ -356,8 +408,13 @@ void EncodeEtc2Rgba8(uint8_t* out, const uint8_t* rgba, int width, int height, i
                         a[x * 4 + y] = slice[(size_t(sy) * size_t(width) + size_t(sx)) * 4 + 3];
                     }
                 uint8_t* dst = out + ((size_t(z) * byn + by) * bxn + bx) * 16;
-                EncodeEacBlock(dst, a);
-                StoreBigEndian(dst + 8, EncodeBlock(t, false));
+                if (quick) {
+                    EncodeEacBlockQuick(dst, a);
+                    StoreBigEndian(dst + 8, EncodeBlockQuick(t, false));
+                } else {
+                    EncodeEacBlock(dst, a);
+                    StoreBigEndian(dst + 8, EncodeBlock(t, false));
+                }
             }
     }
 }

@@ -8,6 +8,7 @@
 //   settings.txt
 //   drivers/       custom Vulkan drivers (.zip as for AdrenoTools, or a bare .so), chosen with gpu_driver
 //   logs/          dsr_<date>_<time>.txt run logs, frame captures, shader dumps (also logcat: adb logcat -s 'DSR/*')
+#include <android/asset_manager.h>
 #include <android/input.h>
 #include <android/log.h>
 #include <android_native_app_glue.h>
@@ -340,7 +341,8 @@ std::string g_custom_game_dir;  // settings.txt `game_dir`: a game folder the pl
 #define GPU_DRIVER_HELP                                                                                      \
     "# gpu_driver: system = the phone's own Vulkan driver; or the name of a file in the drivers folder next\n" \
     "# to this file: a driver .zip as made for AdrenoTools (e.g. Mesa Turnip) or a bare .so\n"                 \
-    "# (e.g. gpu_driver = turnip.zip). If it cannot be loaded, the system driver is used.\n"
+    "# (e.g. gpu_driver = turnip.zip), or a driver that comes with the app: Turnip_Gen8_V39 (Adreno).\n" \
+    "# If it cannot be loaded, the system driver is used.\n"
 #define BC_ENABLER_HELP                                                                                      \
     "# bc_enabler: 1 = on Adreno 6xx system drivers, patch in the compressed (BC) texture formats the GPU\n"   \
     "# supports but the driver hides (faster, and some textures look right); 0 = decode them on the CPU\n"
@@ -448,7 +450,8 @@ void LoadSettings(const std::string& path, dsr::RuntimeConfig* cfg) {
             const int v = atoi(value);
             if (!strcmp(key, "fps")) {  // e.g. 45: a steady cap below 60; auto: dynamic (60 / 30 / 20)
                 cfg->dynamic_fps = !strcmp(value, "auto");
-                cfg->target_fps = cfg->dynamic_fps ? 60 : std::clamp(v, 30, 60);
+                cfg->unlocked_fps = !strcmp(value, "unlocked");
+                cfg->target_fps = cfg->dynamic_fps || cfg->unlocked_fps ? 60 : std::clamp(v, 30, 60);
             } else if (!strcmp(key, "min_fps")) cfg->min_fps = std::clamp(v, 15, 30);
             else if (!strcmp(key, "async_pipelines")) cfg->async_pipelines = v != 0;
             else if (!strcmp(key, "auto_capture")) cfg->auto_capture = v != 0;
@@ -523,6 +526,10 @@ void LoadSettings(const std::string& path, dsr::RuntimeConfig* cfg) {
             else if (!strcmp(key, "mali_barriers")) cfg->mali_barriers = v != 0;
             else if (!strcmp(key, "performance_mode")) cfg->performance_mode = v != 0;
             else if (!strcmp(key, "texture_mip_skip")) cfg->texture_mip_skip = std::clamp(v, 0, 1);
+            else if (!strcmp(key, "pass_load_skip")) cfg->pass_load_skip = v != 0;
+            else if (!strcmp(key, "staging_memory")) cfg->staging_memory = value;
+            else if (!strcmp(key, "recorder_copies")) cfg->recorder_copies = v != 0;
+            else if (!strcmp(key, "lighter_post_fx")) cfg->lighter_post_fx = v != 0;
             else if (!strcmp(key, "gamma")) {
                 const float g = float(atof(value));
                 cfg->gamma = g >= 0.5f && g <= 3.0f ? g : 1.0f;
@@ -596,12 +603,12 @@ void LoadSettings(const std::string& path, dsr::RuntimeConfig* cfg) {
     }
     LOGI(kTag, "settings (%s): fps %d%s, async pipelines %s, auto capture %s, profile %s, gamma %.2f, exposure %.2f, "
          "present mode %s, face buttons by %s",
-         path.c_str(), cfg->target_fps, cfg->dynamic_fps ? " (auto)" : "", cfg->async_pipelines ? "on" : "off", cfg->auto_capture ? "on" : "off",
+         path.c_str(), cfg->target_fps, cfg->dynamic_fps ? " (auto)" : cfg->unlocked_fps ? " (unlocked)" : "", cfg->async_pipelines ? "on" : "off", cfg->auto_capture ? "on" : "off",
          cfg->profile ? "on" : "off", cfg->gamma, cfg->exposure, cfg->present_mode.c_str(),
          g_face_by_position ? "position" : "label");
-    LOGI(kTag, "settings: gpu_driver %s, bc_enabler %d, language %s, render scale %.2f, shadow_compare %d, game_hooks %d, skip_intro %d, render_pass_objects %d, mali_barriers %d, performance_mode %d, texture_mip_skip %d, present_mode %s, hole_test %d", cfg->gpu_driver.c_str(),
+    LOGI(kTag, "settings: gpu_driver %s, bc_enabler %d, language %s, render scale %.2f, shadow_compare %d, game_hooks %d, skip_intro %d, render_pass_objects %d, mali_barriers %d, performance_mode %d, texture_mip_skip %d, lighter_post_fx %d, present_mode %s, hole_test %d", cfg->gpu_driver.c_str(),
          int(cfg->bc_enabler), cfg->language.c_str(), cfg->render_scale, cfg->shadow_compare,
-         int(cfg->game_hooks), int(cfg->skip_intro), int(cfg->render_pass_objects), int(cfg->mali_barriers), int(cfg->performance_mode), cfg->texture_mip_skip, cfg->present_mode.c_str(),
+         int(cfg->game_hooks), int(cfg->skip_intro), int(cfg->render_pass_objects), int(cfg->mali_barriers), int(cfg->performance_mode), cfg->texture_mip_skip, int(cfg->lighter_post_fx), cfg->present_mode.c_str(),
          cfg->hole_test);
     if (!g_custom_game_dir.empty()) LOGI(kTag, "settings: game_dir %s", g_custom_game_dir.c_str());
     LOGI(kTag, "settings: touch controls %s, opacity %.2f, camera speed %.2f%s", g_touch.enabled ? "on" : "off",
@@ -617,7 +624,11 @@ void LoadSettings(const std::string& path, dsr::RuntimeConfig* cfg) {
 constexpr const char* kSharedDir = "/storage/emulated/0/Download/DSRNative";
 
 // GameActivity.storageAccess(): 0 = still waiting for the player's answer, 1 = granted, 2 = refused.
-int StorageAccess(android_app* app) {
+int CallActivityStaticInt(android_app* app, const char* name, int fallback);
+int StorageAccess(android_app* app) { return CallActivityStaticInt(app, "storageAccess", 2); }
+
+// A static `int name()` of the activity class (GameActivity); `fallback` if it cannot be called.
+int CallActivityStaticInt(android_app* app, const char* name, int fallback) {
     JavaVM* vm = app->activity->vm;
     JNIEnv* env = nullptr;
     bool attached_here = false;
@@ -625,13 +636,13 @@ int StorageAccess(android_app* app) {
         if (vm->AttachCurrentThread(&env, nullptr) != JNI_OK || !env) return 2;
         attached_here = true;
     }
-    int r = 2;
+    int r = fallback;
     jclass cls = env->GetObjectClass(app->activity->clazz);
-    jmethodID m = cls ? env->GetStaticMethodID(cls, "storageAccess", "()I") : nullptr;
+    jmethodID m = cls ? env->GetStaticMethodID(cls, name, "()I") : nullptr;
     if (m && !env->ExceptionCheck()) r = env->CallStaticIntMethod(cls, m);
     if (env->ExceptionCheck()) {
         env->ExceptionClear();
-        r = 2;
+        r = fallback;
     }
     if (attached_here) vm->DetachCurrentThread();
     return r;
@@ -804,6 +815,9 @@ std::vector<std::string> Unzip(const std::string& zip, const std::string& dir, c
     return out;
 }
 
+// GPU drivers that come with the app (android/app/src/main/assets/drivers/<name>.zip; licence notes beside them).
+const char* const kBundledDrivers[] = {"Turnip_Gen8_V39"};
+
 // settings.txt `gpu_driver`: the file in <base>/drivers is copied (a .so) or unpacked (a .zip) into the app's
 // private folder, since libraries cannot be loaded from shared storage. Sets cfg->gpu_driver_dir/_lib.
 void PrepareGpuDriver(android_app* app, const std::string& base, dsr::RuntimeConfig* cfg) {
@@ -811,14 +825,49 @@ void PrepareGpuDriver(android_app* app, const std::string& base, dsr::RuntimeCon
     mkdir(drivers.c_str(), 0775);
     cfg->native_lib_dir = NativeLibraryDir(app);
     if (cfg->gpu_driver.empty() || cfg->gpu_driver == "system") return;
-    const std::string src = drivers + "/" + cfg->gpu_driver;
-    if (!FileExists(src)) {
-        LOGW(kTag, "gpu_driver: %s not found: using the system driver", src.c_str());
-        return;
-    }
     const char* priv = app->activity->internalDataPath;
     if (!priv || cfg->native_lib_dir.empty()) {
         LOGW(kTag, "gpu_driver: no private folder or native library folder: using the system driver");
+        return;
+    }
+    std::string src = drivers + "/" + cfg->gpu_driver;
+    // Drivers that come with the app (APK assets/drivers/<name>.zip, chosen by name without ".zip"): copied out of
+    // the APK into the private folder first (kept there while it is the same size).
+    for (const char* bundled : kBundledDrivers) {
+        if (cfg->gpu_driver != bundled) continue;
+        const std::string asset = std::string("drivers/") + bundled + ".zip";
+        src = std::string(priv) + "/bundled_" + bundled + ".zip";
+        AAsset* a = app->activity->assetManager
+                        ? AAssetManager_open(app->activity->assetManager, asset.c_str(), AASSET_MODE_STREAMING)
+                        : nullptr;
+        if (!a) {
+            LOGW(kTag, "gpu_driver: built-in %s missing from the app: using the system driver", bundled);
+            return;
+        }
+        const off64_t size = AAsset_getLength64(a);
+        struct stat st {};
+        if (stat(src.c_str(), &st) != 0 || off64_t(st.st_size) != size) {
+            bool ok = false;
+            if (FILE* w = fopen((src + ".tmp").c_str(), "wb")) {
+                char buf[65536];
+                int n;
+                off64_t total = 0;
+                while ((n = AAsset_read(a, buf, sizeof(buf))) > 0 && fwrite(buf, 1, size_t(n), w) == size_t(n)) total += n;
+                ok = fclose(w) == 0 && total == size;
+            }
+            ok = ok && rename((src + ".tmp").c_str(), src.c_str()) == 0;
+            if (!ok) {
+                AAsset_close(a);
+                unlink((src + ".tmp").c_str());
+                LOGW(kTag, "gpu_driver: could not copy the built-in %s out of the app: using the system driver", bundled);
+                return;
+            }
+        }
+        AAsset_close(a);
+        LOGI(kTag, "gpu_driver: built-in %s (%lld bytes)", bundled, (long long)size);
+    }
+    if (!FileExists(src)) {
+        LOGW(kTag, "gpu_driver: %s not found: using the system driver", src.c_str());
         return;
     }
     const std::string dir = std::string(priv) + "/gpu_driver/";
@@ -971,7 +1020,8 @@ jboolean JNICALL MenuApply(JNIEnv* env, jclass, jstring jkey, jstring jvalue) {
     if (key == "fps") {
         if (dsr::FrameRateAdjustable()) {
             c.dynamic_fps = value == "auto";
-            c.target_fps = c.dynamic_fps ? 60 : std::clamp(atoi(value.c_str()), 30, 60);
+            c.unlocked_fps = value == "unlocked";
+            c.target_fps = c.dynamic_fps || c.unlocked_fps ? 60 : std::clamp(atoi(value.c_str()), 30, 60);
             now = true;
         }
     } else if (key == "face_buttons") {
@@ -1227,6 +1277,7 @@ struct StartState {
     bool reported_missing = false;
 };
 StartState g_start;
+bool g_start_retry = false;  // StartGame wants another try on the next poll timeout (folder not writable yet)
 
 void StartGame(android_app* app) {
     if (g_game_started) return;
@@ -1245,6 +1296,22 @@ void StartGame(android_app* app) {
         st.old_dir = app->activity->externalDataPath ? app->activity->externalDataPath : "";
         st.base = kSharedDir;
         if (access == 1) MakeDirs(st.base);
+        // Access granted but the folder not writable yet (shared storage still starting up right after the device
+        // booted): retried for a few seconds before falling back to the private folder (which has no settings or
+        // saves of the player's).
+        static std::chrono::steady_clock::time_point first_try{};
+        if (access == 1 && !CanWriteIn(st.base)) {
+            const auto now = std::chrono::steady_clock::now();
+            if (first_try.time_since_epoch().count() == 0) {
+                first_try = now;
+                LOGW(kTag, "%s not writable yet (%s): retrying", kSharedDir, strerror(errno));
+            }
+            if (now - first_try < std::chrono::seconds(8)) {
+                st.prepared = false;
+                g_start_retry = true;
+                return;
+            }
+        }
         if (access != 1 || !CanWriteIn(st.base)) {
             LOGW(kTag, "no access to %s (%s): using the app's private folder %s instead", kSharedDir,
                  access == 1 ? strerror(errno) : "storage access refused", st.old_dir.c_str());
@@ -1264,6 +1331,7 @@ void StartGame(android_app* app) {
         mkdir(cfg.save_dir.c_str(), 0775);
         mkdir(cfg.cache_dir.c_str(), 0775);
         mkdir(cfg.cheats_dir.c_str(), 0775);
+        cfg.display_hz = CallActivityStaticInt(app, "displayMaxHz", 60);
         LoadSettings(st.base + "/settings.txt", &cfg);
         if (app->window) {
             const int ww = ANativeWindow_getWidth(app->window), wh = ANativeWindow_getHeight(app->window);
@@ -1520,7 +1588,10 @@ void android_main(android_app* app) {
             if (source) source->process(app, source);
             if (app->destroyRequested) break;
         }
-        if (r == ALOOPER_POLL_TIMEOUT && !g_game_started && app->window && GameFolderState(app) == 2) StartGame(app);
+        if (r == ALOOPER_POLL_TIMEOUT && !g_game_started && app->window && (GameFolderState(app) == 2 || g_start_retry)) {
+            g_start_retry = false;
+            StartGame(app);
+        }
     }
     if (g_glue_env) app->activity->vm->DetachCurrentThread();  // attached for the touch controls
     LOGI(kTag, "activity destroyed (android_main returning)");

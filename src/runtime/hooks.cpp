@@ -57,6 +57,17 @@ struct GameBuild {
     //   shadow_size:   the shadow map size global (debug menu "ShadwoMap Size", 512..2048, 2048): set to 1024
     //                  before the game starts; the engine sizes the shadow target and its texel offsets from it.
     uint64_t lowvfx_read, shadow_size;
+    // The per-frame dynamic buffer (DLDrawDevice_NXNvn: three, one per frame in flight): its size is
+    // `add w8, w8, #0x200, lsl #12` (2 MiB, plus a config value that is 0). A frame that needs more aborts the game
+    // ("DL_PANIC: dynamic buffer not big enough"), as in a busy boss fight on a wide screen: made 8 MiB.
+    uint64_t dyn_buffer;
+    // Lighter post-processing (settings lighter_post_fx): the engine's own switches, from its debug menu, read by
+    // the per-frame setup of the renderer (`ldrb` from the graphics settings object, x19):
+    //   ao[2]:       "Enable AO" (+0x2ca): the ambient-occlusion switch and the render parameter it sets -> 0
+    //   dof:         "Enable DOF" (+0x2e1): passed (inverted) to the image-process manager -> 0 (no depth of field)
+    //   camblur[2]:  "Disable Camera Blur" (+0x295), on both paths to the camera motion blur -> 1
+    //   lightshaft:  the "LightShaft" draw-group switch (a global, 1) where the pass mask is built -> 0
+    uint64_t ao[2], dof, camblur[2], lightshaft;
 };
 const GameBuild kBuilds[] = {
     {"5a797a3a5da6c4f3468cb7c84e4dde63", "1.0.0", "20180818_462",
@@ -64,13 +75,15 @@ const GameBuild kBuilds[] = {
      0x70bd90, 0x251fb4c, 0, 0x310, 0x31d, 0x31e, 0x320,
      0x6a170c, 0x6a18f8, 0x716170, 0x6a1758, 0x6a1968, 0x716178,
      0x7fea18, 0x7feb30, 0x7892d8, 30,
-     0x3620f4, 0x1aeb890},
+     0x3620f4, 0x1aeb890, 0x70b498,
+     {0x370014, 0x370088}, 0x370584, {0x36ea4c, 0x36ea5c}, 0x3623e0},
     {"6569410c91c398e78ec76b418ee4cca8", "1.0.3", "20181026_101",
      0x667930, 0xB0008068, 0xBD455908,
      0x706d28, 0, 0x2f7, 0x2e8, 0x2f5, 0x2f6, 0x2f8,
      0x69c638, 0x69c824, 0x711ff0, 0x69c684, 0x69c894, 0x711ff8,
      0x7f71d4, 0x7f72ec, 0x782dac, 60,
-     0x356790, 0x1adf890},
+     0x356790, 0x1adf890, 0x7065f4,
+     {0x364494, 0x364508}, 0x364a04, {0x362f3c, 0x362f4c}, 0x356a7c},
     // 1.0.3 of title 01004AB00A260000 (update v196608, buildinfo region DV): the same game and data as the other
     // 1.0.3 with its code moved; matched from it, and the limiter's fields are the same.
     {"df3766a2bb651a3e822828abf10b6f7b", "1.0.3", "20181026_101",
@@ -78,7 +91,8 @@ const GameBuild kBuilds[] = {
      0x707090, 0, 0x2f7, 0x2e8, 0x2f5, 0x2f6, 0x2f8,
      0x69c608, 0x69c7f4, 0x711ec8, 0x69c654, 0x69c864, 0x711ed0,
      0x7f9ec8, 0x7f9fe0, 0x784660, 60,
-     0x356790, 0x1ae3890},
+     0x356790, 0x1ae3890, 0x7067ac,
+     {0x364494, 0x364508}, 0x364a04, {0x362f3c, 0x362f4c}, 0x356a7c},
 };
 const GameBuild* g_build = nullptr;
 
@@ -102,6 +116,97 @@ const LogoSkip kLogoSkips[] = {
 };
 constexpr uint32_t kNop = 0xD503201F, kLdrS1Timer = 0xBD40E261;
 
+// Sprint "graze" check (frame-rate fix). Every update the game measures how far the player's character moved since
+// the previous update and, if it was less than 1/30 of a unit (`fmov #30`, multiply, compare with 1: below
+// 1 unit per second at the game's own 30 updates a second), takes it to be running into a wall and slows the
+// movement down: a speed factor (move control +0x1a8, 0.5..1) is multiplied by 0.8 per update, and by 1.2 per update
+// while moving again. The test is per update, so at a higher frame rate an update covers less ground: at 60 fps the
+// threshold is 2 units per second, at 120 fps 4, which a sprint (once slowed down: for good) no longer reaches -
+// the character then sprints at half speed, slower than walking. (Found from the high frame rate fix of
+// DS1 FPS Unlock for the PC version, MIT licence, github.com/zofrea1/DS1-FPS-Unlock-PTDE-Remastered: "FixGraze".)
+// The three constants now come from the scratch page and are set every frame from the game's time step (by
+// FrameLimiter): 1/step, 0.8^(30 step), 1.2^(30 step): the same test and the same slow-down / recovery per second
+// at every frame rate (at 30 fps exactly the game's).
+struct GrazeFix {
+    const char* build_id;
+    // 1.0.3 (optimised code): fmov s0,#30 / fmul s0,s0,v1.s[0] / fmov s1,wzr / tst w8,#1 / add x8,x19,#0x1a8 at
+    // `mul`, the result stored by str s0,[x8] at `store`. Rewritten as adrp x9,scratch / ldr s0,[x9,#4] / fmul /
+    // fmov / tst, the store as str s0,[x19,#0x1a8] (x8 is only its address, x9 is loaded again before it is used).
+    // 1.0.0 (unoptimised): fmov s1,#30 / fmul s0,s0,s1 / stur s0,[x29,#-0x18] / ldur s0,[x29,#-0x18] at `mul`:
+    // adrp x9,scratch / ldr s1,[x9,#4] / fmul / stur (the reload of the value just stored is dropped).
+    bool optimised;
+    uint64_t mul, store;
+    uint64_t decay, recover;  // adrp x9,page / ldr s1,[x9,#lo] loading 0.8 and 1.2: now the scratch page's
+    uint32_t decay_insn[2], recover_insn[2];
+};
+const GrazeFix kGrazeFixes[] = {
+    {"5a797a3a", false, 0x2a3be8, 0, 0x2a3c48, 0x2a3c90, {0xD0009EE9, 0xBD48CD21}, {0xD0009EE9, 0xBD495521}},
+    {"6569410c", true, 0x29c874, 0x29c8d4, 0x29c898, 0x29c8bc, {0x90009EC9, 0xBD44B521}, {0x90009EC9, 0xBD453D21}},
+    {"df3766a2", true, 0x29c874, 0x29c8d4, 0x29c898, 0x29c8bc, {0xD0009EE9, 0xBD464921}, {0xD0009EE9, 0xBD46D121}},
+};
+float* g_graze = nullptr;  // scratch page: [0] 1/step, [1] slow-down, [2] recovery per update
+
+void SetGrazeFactors(float step) {
+    if (!g_graze || !(step > 0.0f)) return;
+    g_graze[0] = 1.0f / step;
+    g_graze[1] = std::pow(0.8f, 30.0f * step);
+    g_graze[2] = std::pow(1.2f, 30.0f * step);
+}
+
+void ApplyGrazeFix(Runtime& rt, float* graze) {
+    const GrazeFix* f = nullptr;
+    for (const GrazeFix& g : kGrazeFixes)
+        if (rt.main_nso.build_id_hex.rfind(g.build_id, 0) == 0) f = &g;
+    if (!f) return;
+    const uintptr_t page = reinterpret_cast<uintptr_t>(graze);
+    const uint32_t off = uint32_t(page & 0xfff);  // 4 (after the time step)
+    auto ldr_s = [&](int rt_, uint32_t byte_off) { return 0xBD400000u | ((byte_off / 4) << 10) | (9u << 5) | uint32_t(rt_); };
+    struct P { uint64_t at; uint32_t from, to; };
+    std::vector<P> p;
+    if (f->optimised) {
+        p = {{f->mul, 0x1E27D000, rt.main.EncodeAdrp(f->mul, 9, page)},
+             {f->mul + 4, 0x5F819000, ldr_s(0, off)},
+             {f->mul + 8, 0x1E2703E1, 0x5F819000},
+             {f->mul + 12, 0x7200011F, 0x1E2703E1},
+             {f->mul + 16, 0x9106A268, 0x7200011F},
+             {f->store, 0xBD000100, 0xBD01AA60}};  // str s0,[x8] -> str s0,[x19,#0x1a8]
+    } else {
+        p = {{f->mul, 0x1E27D001, rt.main.EncodeAdrp(f->mul, 9, page)},
+             {f->mul + 4, 0x1E210800, ldr_s(1, off)},
+             {f->mul + 8, 0xBC1E83A0, 0x1E210800},
+             {f->mul + 12, 0xBC5E83A0, 0xBC1E83A0}};
+    }
+    p.push_back({f->decay, f->decay_insn[0], rt.main.EncodeAdrp(f->decay, 9, page)});
+    p.push_back({f->decay + 4, f->decay_insn[1], ldr_s(1, off + 4)});
+    p.push_back({f->recover, f->recover_insn[0], rt.main.EncodeAdrp(f->recover, 9, page)});
+    p.push_back({f->recover + 4, f->recover_insn[1], ldr_s(1, off + 8)});
+    // All checked before anything changes.
+    for (const P& x : p) {
+        const uint32_t* at = reinterpret_cast<const uint32_t*>(rt.main.base() + x.at);
+        if (*at != x.from) {
+            LOGW("hooks", "sprint frame-rate fix not applied: main+0x%lx is %08x, expected %08x", (unsigned long)x.at,
+                 *at, x.from);
+            return;
+        }
+    }
+    graze[0] = 30.0f;
+    graze[1] = 0.8f;
+    graze[2] = 1.2f;
+    std::string err;
+    size_t done = 0;
+    for (const P& x : p) {
+        if (!rt.main.PatchInstruction(x.at, x.from, x.to, &err)) break;
+        ++done;
+    }
+    if (done != p.size()) {
+        for (size_t i = done; i-- > 0;) rt.main.PatchInstruction(p[i].at, p[i].to, p[i].from, &err);
+        LOGW("hooks", "sprint frame-rate fix not applied (%s)", err.c_str());
+        return;
+    }
+    g_graze = graze;
+    LOGI("hooks", "sprint frame-rate fix: the wall check and its slow-down follow the time step");
+}
+
 // Performance mode: low-quality effects, 1024x1024 shadow maps (see GameBuild); the menu also sets render scale 0.75.
 // Each part is checked before it is changed and is skipped (logged) if the game's code or data is not as expected.
 void ApplyPerformanceMode(Runtime& rt, const GameBuild& b) {
@@ -122,6 +227,38 @@ void ApplyPerformanceMode(Runtime& rt, const GameBuild& b) {
              rt.main.Contains(reinterpret_cast<uintptr_t>(shadow)) ? *shadow : -1);
     }
     LOGI("hooks", "performance mode: %s", done.empty() ? "nothing applied" : done.c_str());
+}
+
+// Lighter post-processing: no ambient occlusion, depth of field, camera motion blur or light shafts (see GameBuild).
+// All or nothing: every instruction is checked first.
+void ApplyLighterPostFx(Runtime& rt, const GameBuild& b) {
+    struct P {
+        uint64_t off;
+        uint32_t from, to;
+    };
+    const P patches[] = {
+        {b.ao[0], 0x394B2A60, 0x52800000},       // ldrb w0, [x19, #0x2ca]  -> mov w0, #0
+        {b.ao[1], 0x394B2A77, 0x52800017},       // ldrb w23, [x19, #0x2ca] -> mov w23, #0
+        {b.dof, 0x394B8668, 0x52800008},         // ldrb w8, [x19, #0x2e1]  -> mov w8, #0
+        {b.camblur[0], 0x394A5668, 0x52800028},  // ldrb w8, [x19, #0x295]  -> mov w8, #1
+        {b.camblur[1], 0x394A5668, 0x52800028},
+        {b.lightshaft, 0x39400108, 0x52800008},  // ldrb w8, [x8]           -> mov w8, #0
+    };
+    for (const P& p : patches) {
+        const uint32_t* at = reinterpret_cast<const uint32_t*>(rt.main.base() + p.off);
+        if (!rt.main.Contains(reinterpret_cast<uintptr_t>(at)) || *at != p.from) {
+            LOGW("hooks", "lighter post-processing not applied: main+0x%llx is not as expected",
+                 (unsigned long long)p.off);
+            return;
+        }
+    }
+    std::string err;
+    for (const P& p : patches)
+        if (!rt.main.PatchInstruction(p.off, p.from, p.to, &err)) {
+            LOGW("hooks", "lighter post-processing: %s", err.c_str());
+            return;
+        }
+    LOGI("hooks", "lighter post-processing: no ambient occlusion, depth of field, camera motion blur or light shafts");
 }
 
 void SkipIntroLogos(Runtime& rt, const GameBuild& b) {
@@ -250,7 +387,12 @@ void FrameLimiter(uint8_t* self, int /*fps*/) {
     // Up to 1/20 s per step (1/min_fps with fps = auto and min_fps 15): slower devices keep the game at normal speed
     // instead of slow motion.
     const double slowest = rt.config.dynamic_fps ? std::min(MinFps(), 20) : 20;
-    if (g_game_step) *g_game_step = float(std::clamp(seconds, 1.0 / 60.0, 1.0 / slowest));
+    // Down to 1/60 s (fps = unlocked: one period of the screen's refresh rate).
+    const double fastest = rt.config.unlocked_fps && !rt.config.dynamic_fps ? std::max(60, FixedFps(rt.config)) : 60;
+    if (g_game_step) {
+        *g_game_step = float(std::clamp(seconds, 1.0 / fastest, 1.0 / slowest));
+        SetGrazeFactors(*g_game_step);
+    }
     *reinterpret_cast<int64_t*>(self + b.last_tick) = hle::os::NowTicks();
     self[b.skip_active] = 0;
     self[b.skip_toggle] = 0;
@@ -388,7 +530,7 @@ int GpuHasBc() { return g_gpu_has_bc.load(); }
 int FrameRateNow() {
     if (MoviePlaying()) return MovieFps();
     const RuntimeConfig& c = GetRuntime().config;
-    return c.dynamic_fps ? g_cap_fps.load(std::memory_order_relaxed) : std::clamp(c.target_fps, 30, 60);
+    return c.dynamic_fps ? g_cap_fps.load(std::memory_order_relaxed) : FixedFps(c);
 }
 
 const char* GameVersion() { return g_build ? g_build->version : nullptr; }
@@ -402,12 +544,14 @@ void InstallGameHooks() {
              g_build->version);
         rt.config.target_fps = 30;
         rt.config.dynamic_fps = false;
+        rt.config.unlocked_fps = false;
         return;
     }
     if (!g_build) {
         LOGW("hooks", "unknown game build %.32s: engine hooks disabled (supported: 1.0.0, 1.0.3)",
              rt.main_nso.build_id_hex.c_str());
         rt.config.dynamic_fps = false;  // no frame limiter of ours: the game paces itself
+        rt.config.unlocked_fps = false;
         return;
     }
     const GameBuild& b = *g_build;
@@ -448,18 +592,24 @@ void InstallGameHooks() {
         if (ok) ok = rt.main.HookFunction(b.limiter, reinterpret_cast<void*>(&FrameLimiter), &err);
         if (ok) {
             g_game_step = step;
+            ApplyGrazeFix(rt, step + 1);
             if (rt.config.dynamic_fps)
                 LOGI("hooks", "frame rate: own frame limiter, fps auto (60 / 30 / 20 fps, not below %d; changeable in game), "
                      "game time step follows the frame time", MinFps());
+            else if (rt.config.unlocked_fps)
+                LOGI("hooks", "frame rate: own frame limiter, unlocked (experimental): up to %d fps, the screen's refresh "
+                     "rate (changeable in game); game time step follows the frame time, physics may misbehave above 60",
+                     FixedFps(rt.config));
             else
                 LOGI("hooks", "frame rate: own frame limiter at %d fps (changeable in game), game time step follows the frame time",
-                     std::clamp(rt.config.target_fps, 30, 60));
+                     FixedFps(rt.config));
         } else {
             LOGW("hooks", "60 fps patches failed (%s): staying at 30 fps", err.c_str());
             rt.main.PatchInstruction(b.step_adrp + 4, 0xBD400108, b.step_ldr_insn, &err);  // undo what applied
             if (adrp_ok) rt.main.PatchInstruction(b.step_adrp, adrp, b.step_adrp_insn, &err);
             rt.config.target_fps = 30;
             rt.config.dynamic_fps = false;
+            rt.config.unlocked_fps = false;
         }
     }
     // Aspect ratio (offsets below are 1.0.0's; kBuilds has each build's). Two places set the game's resolution, both
@@ -524,6 +674,16 @@ void InstallGameHooks() {
     }
     if (rt.config.skip_intro) SkipIntroLogos(rt, b);
     if (rt.config.performance_mode) ApplyPerformanceMode(rt, b);
+    if (rt.config.lighter_post_fx) ApplyLighterPostFx(rt, b);
+    {
+        constexpr uint32_t kAdd2MiB = 0x11480108;  // add w8, w8, #0x200, lsl #12
+        constexpr uint32_t kAdd8MiB = 0x11600108;  // add w8, w8, #0x800, lsl #12
+        std::string err;
+        if (rt.main.PatchInstruction(b.dyn_buffer, kAdd2MiB, kAdd8MiB, &err))
+            LOGI("hooks", "dynamic buffers: 8 MiB each (were 2 MiB)");
+        else
+            LOGW("hooks", "dynamic buffer size not changed (%s)", err.c_str());
+    }
     const Hook hooks[] = {
         {b.log, reinterpret_cast<void*>(&EngineLog), "engine log"},
         {b.vlog, reinterpret_cast<void*>(&EngineLogV), "engine vlog"},

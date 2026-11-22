@@ -27,8 +27,10 @@ size_t EtcRgba8LevelBytes(int width, int height, int depth);
 
 // Encodes `depth` slices of width x height RGBA8 texels (rows of width * 4 bytes), blocks row by row.
 // punch_through: RGB8A1 (alpha < 128 = transparent); otherwise RGB8 (alpha ignored).
-void EncodeEtc2Rgb(uint8_t* out, const uint8_t* rgba, int width, int height, int depth, bool punch_through);
-void EncodeEtc2Rgba8(uint8_t* out, const uint8_t* rgba, int width, int height, int depth);
+// quick: a coarser, several times faster encode (a preview shown while the full one runs in the background).
+void EncodeEtc2Rgb(uint8_t* out, const uint8_t* rgba, int width, int height, int depth, bool punch_through,
+                   bool quick = false);
+void EncodeEtc2Rgba8(uint8_t* out, const uint8_t* rgba, int width, int height, int depth, bool quick = false);
 
 // Decoders of one block into 16 RGBA texels, row-major (y * 4 + x): for tests.
 void DecodeEtc2RgbBlock(const uint8_t* block, bool punch_through, uint8_t out[16][4]);
