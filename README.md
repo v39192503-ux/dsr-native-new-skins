@@ -136,3 +136,16 @@ cmake -S . -B build-host && cmake --build build-host -j
 ```
 
 On x86 it maps/relocates/binds and prints the import coverage report. On an arm64 Linux machine `--run` executes the game the same way the APK does (useful for debugging HLE without a phone).
+
+
+## Fork updates / Changelog
+
+### 0.3.1 — Custom touch skins
+
+This update integrates the custom touch-control skin assets from [v39192503-ux/dsr-native-new-skins v0.3.0](https://github.com/v39192503-ux/dsr-native-new-skins/releases/tag/v0.3.0) into the overlay renderer. The update also references [fernanfez00/dsr-native-mali Release 3.0](https://github.com/fernanfez00/dsr-native-mali/releases/tag/3.0) as the Mali compatibility/update fork used for the project update reference.
+
+- Cached skin bitmaps; custom visuals for face, shoulder, trigger, menu, D-pad, L3 and lock buttons.
+- Textured left stick base/nub, with pressed-state variants and ring feedback where applicable.
+- Touch hitboxes and input logic, multitouch, camera drag and physical-controller handling preserved.
+- Verified a debug build and a short launch/render test on POCO F5; not a full gameplay stability test.
+- See PATCH_NOTES.md and SKINS_IMPLEMENTED_0.3.1.md for details.

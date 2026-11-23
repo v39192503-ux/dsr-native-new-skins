@@ -13,8 +13,10 @@ android {
         minSdk 29
         targetSdk 34
         // CI sets GITHUB_RUN_NUMBER, so every GitHub build installs as a newer version.
-        versionCode((System.getenv('GITHUB_RUN_NUMBER') ?: '1') as int)
-        versionName "0.1.${System.getenv('GITHUB_RUN_NUMBER') ?: '0'}"
+        def ciRunNumber = (System.getenv('GITHUB_RUN_NUMBER') ?: '4') as int
+        def appVersionCode = Math.max(4, ciRunNumber)
+        versionCode appVersionCode
+        versionName "0.3.${appVersionCode - 3}"
         ndk {
             abiFilters 'arm64-v8a'
         }
@@ -27,7 +29,7 @@ android {
         }
     }
 
-    // A fixed debug key (checked into the repo; it protects nothing) so every build — local or CI —
+    // A fixed debug key (checked into the repo; it protects nothing) so every build â€” local or CI â€”
     // has the same signature and installs over the previous one instead of failing with
     // "package conflicts with an existing package".
     signingConfigs {
@@ -66,3 +68,4 @@ android {
         }
     }
 }
+

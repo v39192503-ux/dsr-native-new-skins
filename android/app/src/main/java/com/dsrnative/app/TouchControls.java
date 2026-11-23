@@ -4,6 +4,8 @@ import android.app.Activity;
 import android.content.Context;
 import android.graphics.Canvas;
 import android.graphics.Paint;
+import android.graphics.Bitmap;
+import android.graphics.BitmapFactory;
 import android.graphics.PixelFormat;
 import android.graphics.RectF;
 import android.hardware.input.InputManager;
@@ -262,7 +264,30 @@ public final class TouchControls extends View implements InputManager.InputDevic
     private final Paint mFill = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint mStroke = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint mText = new Paint(Paint.ANTI_ALIAS_FLAG);
+    private final Paint mSkinPaint = new Paint(Paint.ANTI_ALIAS_FLAG | Paint.FILTER_BITMAP_FLAG);
     private final RectF mRect = new RectF();
+    private final Map<String, Bitmap> mSkins = new HashMap<>();
+
+    private Bitmap loadSkin(String name) {
+        try (java.io.InputStream in = getContext().getAssets().open("skin/" + name + ".png")) {
+            Bitmap b = BitmapFactory.decodeStream(in);
+            if (b != null) mSkins.put(name, b);
+            else android.util.Log.w("DSRNative", "skin decode returned null: " + name);
+            return b;
+        } catch (Exception e) {
+            android.util.Log.w("DSRNative", "skin asset missing: " + name, e);
+            return null;
+        }
+    }
+
+    private void drawSkin(Canvas c, String name, float cx, float cy, float w, float h, boolean pressed) {
+        Bitmap b = mSkins.get(name + (pressed ? "_lit" : ""));
+        if (b == null && pressed) b = mSkins.get(name);
+        if (b == null) return;
+        mRect.set(cx - w / 2f, cy - h / 2f, cx + w / 2f, cy + h / 2f);
+        mSkinPaint.setAlpha(255);
+        c.drawBitmap(b, null, mRect, mSkinPaint);
+    }
 
     private TouchControls(Activity activity, float opacity, float cameraSpeed) {
         super(activity);
@@ -275,6 +300,9 @@ public final class TouchControls extends View implements InputManager.InputDevic
         mText.setColor(0xFFFFFFFF);
         mText.setTextAlign(Paint.Align.CENTER);
         mText.setFakeBoldText(true);
+        // Decode the custom control skin once per overlay instance, never in onDraw().
+        String[] skinNames = {"a", "b", "x", "y", "l", "l_lit", "r", "r_lit", "zl", "zl_lit", "zr", "zr_lit", "minus", "plus", "lock", "l3", "dpad_up", "dpad_up_lit", "dpad_down", "dpad_down_lit", "dpad_left", "dpad_left_lit", "dpad_right", "dpad_right_lit", "stick_base", "stick_base_lit", "stick_nub", "stick_nub_lit", "ring"};
+        for (String skin : skinNames) loadSkin(skin);
         mButtons.add(new Button("A", A, true, "face"));
         mButtons.add(new Button("B", B, true, "face"));
         mButtons.add(new Button("X", X, true, "face"));
@@ -894,13 +922,12 @@ public final class TouchControls extends View implements InputManager.InputDevic
     protected void onDraw(Canvas c) {
         if (!mShown) return;
         if (mEditing) c.drawColor(0x50000000);
-        // Stick (the knob stays inside the ring).
+        // Custom left-stick skin (base + nub); touch hit areas and movement logic remain unchanged.
         final float bx = mStickBaseX, by = mStickBaseY;
-        mFill.setColor(mEditing && ("stick".equals(mDragGroup) || "stick".equals(mSelGroup)) ? 0xA0C9A55C : 0x40000000);
-        c.drawCircle(bx, by, mStickRadius, mFill);
-        c.drawCircle(bx, by, mStickRadius, mStroke);
+        boolean stickPressed = mStickPointer >= 0;
+        drawSkin(c, "stick_base", bx, by, mStickRadius * 2f, mStickRadius * 2f, stickPressed);
         float kx = bx, ky = by;
-        if (mStickPointer >= 0) {
+        if (stickPressed) {
             float dx = mStickX - bx, dy = mStickY - by, len = (float) Math.sqrt(dx * dx + dy * dy);
             if (len > mStickRadius) {
                 dx = dx / len * mStickRadius;
@@ -909,8 +936,7 @@ public final class TouchControls extends View implements InputManager.InputDevic
             kx = bx + dx;
             ky = by + dy;
         }
-        mFill.setColor(mStickPointer >= 0 ? 0xA0FFFFFF : 0x60FFFFFF);
-        c.drawCircle(kx, ky, mStickRadius * 0.45f, mFill);
+        drawSkin(c, "stick_nub", kx, ky, mStickRadius * 0.9f, mStickRadius * 0.9f, stickPressed);
         // Camera stick, only while touched, faint: 10% opaque on screen (whatever touch_opacity is).
         if (mRStickPointer >= 0) {
             final int a = Math.max(1, Math.min(255, Math.round(255 * 0.10f / Math.max(0.1f, getAlpha()))));
@@ -927,25 +953,41 @@ public final class TouchControls extends View implements InputManager.InputDevic
             mFill.setColor((a << 24) | 0xFFFFFF);
             c.drawCircle(mRBaseX + dx, mRBaseY + dy, mRRadius * 0.45f, mFill);
         }
-        // Buttons.
+        // Draw the fork's custom assets. Pressed variants are used where supplied; the ember ring
+        // is overlaid for face/menu/utility buttons. Labels and hitboxes are not used for skin rendering.
         for (Button b : mButtons) {
             boolean on = b.pressCount > 0;
-            mFill.setColor(mEditing && (b.group.equals(mDragGroup) || b.group.equals(mSelGroup)) ? 0xC0C9A55C
-                    : on ? 0x90FFFFFF : 0x50000000);
-            if (b.round) {
-                c.drawCircle(b.cx, b.cy, b.w / 2, mFill);
-                c.drawCircle(b.cx, b.cy, b.w / 2, mStroke);
-            } else {
-                mRect.set(b.cx - b.w / 2, b.cy - b.h / 2, b.cx + b.w / 2, b.cy + b.h / 2);
-                float r = Math.min(b.w, b.h) * 0.3f;
-                c.drawRoundRect(mRect, r, r, mFill);
-                c.drawRoundRect(mRect, r, r, mStroke);
+            String skin;
+            switch (b.bit) {
+                case A: skin = "a"; break;
+                case B: skin = "b"; break;
+                case X: skin = "x"; break;
+                case Y: skin = "y"; break;
+                case L: skin = "l"; break;
+                case R: skin = "r"; break;
+                case ZL: skin = "zl"; break;
+                case ZR: skin = "zr"; break;
+                case MINUS: skin = "minus"; break;
+                case PLUS: skin = "plus"; break;
+                case UP: skin = "dpad_up"; break;
+                case DOWN: skin = "dpad_down"; break;
+                case LEFT: skin = "dpad_left"; break;
+                case RIGHT: skin = "dpad_right"; break;
+                case L3: skin = "l3"; break;
+                case R3: skin = "lock"; break;
+                default: skin = null; break;
             }
-            mText.setColor(on ? 0xFF000000 : 0xFFFFFFFF);
-            float size = mText.getTextSize();
-            if (b.label.length() > 2) mText.setTextSize(size * 0.7f);
-            c.drawText(b.label, b.cx, b.cy - (mText.descent() + mText.ascent()) / 2, mText);
-            mText.setTextSize(size);
+            if (skin != null) {
+                drawSkin(c, skin, b.cx, b.cy, b.w, b.h, on);
+                if (on && !mSkins.containsKey(skin + "_lit")) {
+                    drawSkin(c, "ring", b.cx, b.cy, b.w * 1.08f, b.h * 1.08f, false);
+                }
+            }
+            if (mEditing && (b.group.equals(mDragGroup) || b.group.equals(mSelGroup))) {
+                mFill.setColor(0x40C9A55C);
+                if (b.round) c.drawCircle(b.cx, b.cy, b.w * 0.54f, mFill);
+                else { mRect.set(b.cx-b.w/2f,b.cy-b.h/2f,b.cx+b.w/2f,b.cy+b.h/2f); c.drawRoundRect(mRect,0.18f*mU,0.18f*mU,mFill); }
+            }
         }
         if (mEditing) drawEditor(c);
     }
