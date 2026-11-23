@@ -24,3 +24,23 @@
 - Version: 0.3.1 / versionCode 4
 - ABI: arm64-v8a; Android 10+ (minSdk 29)
 - APK debug; não é assinatura release de produção.
+
+
+## Como instalar os arquivos do jogo no Android
+
+As instruções seguem o procedimento documentado na release [v0.2.170 — skins e correções nos controles](https://github.com/v39192503-ux/dsr-native-new-skins/releases/tag/v0.2.170). O APK e o repositório não incluem arquivos do jogo: use uma cópia legal que você possui.
+
+### Método 1 — Importar NSP/XCI pelo app
+1. Instale o APK e abra o DSR Native.
+2. Conceda a permissão de acesso aos arquivos quando solicitado.
+3. Selecione seu arquivo de jogo NSP ou XCI. Se tiver o update 1.0.3, pode selecioná-lo também (opcional, conforme a release).
+4. Para a extração pelo aplicativo, é necessário seu próprio arquivo `prod.keys`. O app extrairá os arquivos para `/Download/DSRNative/game/` e iniciará a partir dessa pasta.
+
+### Método 2 — Extrair os arquivos no PC e copiar para o telefone
+1. Usando sua cópia do jogo e uma ferramenta compatível como Ryubing, extraia os arquivos `romfs` e `exefs` no PC.
+2. Abra o APK uma vez no Android e conceda permissão de arquivos para ele criar os diretórios necessários.
+3. No app, selecione a pasta onde você colocou os arquivos extraídos.
+4. A pasta selecionada precisa conter os arquivos do `romfs`, incluindo as pastas `movww` e `movjp`, e uma pasta `exefs` criada por você com os arquivos extraídos de `exefs`.
+5. Se usar o diretório padrão, coloque os arquivos na pasta `Download/DSRNative/game/`.
+
+**Estrutura esperada:** a pasta do jogo contém os arquivos extraídos do `romfs` (incluindo `movww` e `movjp`) e a subpasta `exefs/` com os arquivos do executável. Não distribua nem inclua os arquivos do jogo, ROM, keys ou dumps no repositório ou na Release.
